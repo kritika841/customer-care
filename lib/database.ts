@@ -110,7 +110,7 @@ export class PostgresDatabase {
     this.pool = new Pool({
       connectionString: url.toString(),
       ...(supabase ? { ssl: { ca: supabaseCA, rejectUnauthorized: true } } : {}),
-      max: isLocal ? 4 : 10,
+      max: isLocal ? 1 : 10,
       connectionTimeoutMillis: isLocal ? 15000 : 5000,
       idleTimeoutMillis: 30000,
       query_timeout: 15000,
@@ -127,8 +127,17 @@ export class PostgresDatabase {
   }
 
   private async execute(text: string, values: unknown[]) {
-    const result = await this.pool.query(postgresPlaceholders(text, values.length), values);
-    return normalizeRows(result.rows);
+    const sql = postgresPlaceholders(text, values.length);
+    try {
+      const result = await this.pool.query(sql, values);
+      return normalizeRows(result.rows);
+    } catch (err) {
+      if ((err as { code?: string })?.code === "26000") {
+        const retry = await this.pool.query(sql, values);
+        return normalizeRows(retry.rows);
+      }
+      throw err;
+    }
   }
 
   async close() {

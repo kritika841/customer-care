@@ -23,6 +23,7 @@ export type MessageTokenUsage = {
 
 export type Message = {
   id: string;
+  ticket_id?: string;
   direction: string;
   body: string;
   sender: string;

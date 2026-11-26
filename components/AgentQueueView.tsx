@@ -80,7 +80,11 @@ export default function AgentQueueView({
     }
   }, [activeId, activeTicketId, onSelectTicket]);
 
-  const chatMessages = messages.filter((m) => m.direction !== "note");
+  const ticketMatched = selectedTicket?.id === activeId;
+  const scopedMessages = messages.filter((m) =>
+    m.ticket_id ? m.ticket_id === activeId : ticketMatched,
+  );
+  const chatMessages = scopedMessages.filter((m) => m.direction !== "note");
   const aiDraftMsg = [...chatMessages]
     .reverse()
     .find((m) => m.delivery_status === "ai_draft");

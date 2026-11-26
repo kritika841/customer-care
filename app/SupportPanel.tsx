@@ -360,7 +360,9 @@ export default function SupportPanel({
       return () => clearTimeout(timer);
     }
   }, []);
-  const activeMessages = data.messages as Message[];
+  const activeMessages = (data.messages as Message[]).filter(
+    (m) => !m.ticket_id || m.ticket_id === selected,
+  );
   const chatMessages = activeMessages.filter((m) => m.direction !== "note");
   const internalNotes = activeMessages.filter((m) => m.direction === "note");
   const activeCustomer = data.customer as CustomerInfo;
@@ -1044,7 +1046,7 @@ export default function SupportPanel({
       {/* MAIN FULL-WIDTH CONTENT */}
       {!inTicketWorkspace && (
       <main className="flex-1 min-w-0">
-        <div className="mx-auto w-full max-w-[1640px] px-4 sm:px-6 py-4 pb-32 space-y-4">
+        <div className="mx-auto w-full max-w-[1640px] px-4 sm:px-6 py-4 pb-20 space-y-4">
           {/* Error / Notice Banners */}
           {error && (
             <div
