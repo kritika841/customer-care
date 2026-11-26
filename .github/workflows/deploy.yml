@@ -1,0 +1,95 @@
+name: Deploy Customer Support to VPS
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-satmi-support
+  cancel-in-progress: true
+
+env:
+  APP_DIR: ${{ secrets.VPS_APP_DIR || '/home/deployer/apps/satmi-support' }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript check
+        run: npx tsc --noEmit
+
+      - name: Run unit tests
+        run: npm run test:support
+
+      - name: Lint
+        run: npm run lint
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate VPS secrets
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          if [ -z "$VPS_HOST" ] || [ -z "$VPS_USER" ] || [ -z "$VPS_SSH_KEY" ]; then
+            echo "::error::Missing required repository secrets: VPS_HOST, VPS_USER, and VPS_SSH_KEY."
+            exit 1
+          fi
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -p "${{ secrets.VPS_PORT || 22 }}" -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Sync code to VPS
+        run: |
+          SSH="ssh -i ~/.ssh/id_deploy -p ${{ secrets.VPS_PORT || 22 }}"
+          TARGET="${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}"
+          $SSH "$TARGET" "mkdir -p $APP_DIR /home/deployer/logs"
+          rsync -az --delete -e "$SSH" \
+            --exclude '.git/' \
+            --exclude 'node_modules/' \
+            --exclude '.next/' \
+            --exclude '.local-pgdata/' \
+            --exclude '.env*' \
+            --exclude 'tsconfig.tsbuildinfo' \
+            ./ "$TARGET:$APP_DIR/"
+
+      - name: Install, migrate DB, build, and restart PM2 on VPS
+        run: |
+          ssh -i ~/.ssh/id_deploy -p "${{ secrets.VPS_PORT || 22 }}" \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" "APP_DIR='$APP_DIR' bash -se" <<'REMOTE'
+          set -e
+          cd "$APP_DIR"
+          npm ci --no-audit --no-fund
+          npm run apply:support
+          npm run build
+          pm2 startOrReload ecosystem.config.cjs --update-env
+          pm2 save
+          sleep 3
+          curl -fsS -o /dev/null http://127.0.0.1:5010/auth/sign-in && echo "satmi-support is up on :5010"
+          REMOTE

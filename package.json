@@ -1,0 +1,51 @@
+{
+  "name": "satmi-customer-support",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "next dev -p 5010",
+    "build": "next build --webpack",
+    "start": "next start",
+    "test": "npm run build",
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
+    "test:support": "node --import tsx --test tests/support.test.ts",
+    "local:db": "node --import tsx scripts/local-db.ts",
+    "check:support": "node --env-file=.env.local --import tsx scripts/check-operations-config.ts",
+    "apply:support": "node --env-file=.env.local --import tsx scripts/apply-operations.ts",
+    "scheduler": "node --env-file=.env.local scripts/scheduler.mjs"
+  },
+  "dependencies": {
+    "@supabase/ssr": "^0.12.7",
+    "@supabase/supabase-js": "^2.116.0",
+    "lucide-react": "^0.468.0",
+    "next": "^16.4.6",
+    "pg": "^8.23.0",
+    "postgres": "^3.4.9",
+    "react": "19.2.6",
+    "react-dom": "19.2.6"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.16",
+    "@electric-sql/pglite-socket": "^0.2.19",
+    "@eslint/js": "9.39.4",
+    "@next/eslint-plugin-next": "^16.4.6",
+    "@tailwindcss/postcss": "4.2.1",
+    "@types/node": "22.19.19",
+    "@types/pg": "^8.23.1",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "eslint": "9.39.4",
+    "eslint-plugin-jsx-a11y": "6.10.2",
+    "eslint-plugin-react": "7.37.5",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "globals": "16.4.0",
+    "tailwindcss": "4.2.1",
+    "tsx": "^4.20.6",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.59.3"
+  },
+  "type": "module"
+}

@@ -1,0 +1,391 @@
+import { createHash } from "node:crypto";
+
+export const EMBEDDING_DIM = 768;
+export const DEFAULT_GEMINI_CHAT_MODEL =
+  process.env.GEMINI_MODEL || "gemini-2.5-flash";
+export const DEFAULT_GEMINI_EMBED_MODELS = [
+  process.env.GEMINI_EMBEDDING_MODEL || "gemini-embedding-001",
+  "text-embedding-004",
+];
+
+export function getGeminiApiKey(): string {
+  return (
+    process.env.GEMINI_API_KEY ||
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
+    process.env.GOOGLE_AI_API_KEY ||
+    ""
+  ).trim();
+}
+
+export function getOpenAiApiKey(): string {
+  return (process.env.OPENAI_API_KEY || "").trim();
+}
+
+export function getConfiguredAiProviderInfo(): {
+  provider: "gemini" | "openai" | "local_heuristic";
+  chatModel: string;
+  embeddingModel: string;
+  apiKeyConfigured: boolean;
+} {
+  if (getGeminiApiKey()) {
+    return {
+      provider: "gemini",
+      chatModel: DEFAULT_GEMINI_CHAT_MODEL,
+      embeddingModel: DEFAULT_GEMINI_EMBED_MODELS[0],
+      apiKeyConfigured: true,
+    };
+  }
+  if (getOpenAiApiKey()) {
+    return {
+      provider: "openai",
+      chatModel: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      embeddingModel: "text-embedding-3-small",
+      apiKeyConfigured: true,
+    };
+  }
+  return {
+    provider: "local_heuristic",
+    chatModel: "satmi-local-grounded-v1 (configure GEMINI_API_KEY for Gemini 2.5 Flash)",
+    embeddingModel: "satmi-hashed-ngram-768 (configure GEMINI_API_KEY for text-embedding-004)",
+    apiKeyConfigured: false,
+  };
+}
+
+/**
+ * Estimates LLM token count for English/Hinglish customer support threads.
+ * Uses a conservative ~3.7 chars/token + word boundary estimator.
+ */
+export function estimateTokenCount(text: string): number {
+  const clean = String(text || "");
+  if (!clean) return 0;
+  const charEstimate = Math.ceil(clean.length / 3.7);
+  const words = clean.trim().split(/\s+/).filter(Boolean).length;
+  const wordEstimate = Math.ceil(words * 1.35);
+  return Math.max(charEstimate, wordEstimate);
+}
+
+/**
+ * Normalizes a vector to unit L2 norm so dot-product equals cosine similarity.
+ */
+export function normalizeVector(vec: number[]): number[] {
+  let normSq = 0;
+  for (let i = 0; i < vec.length; i++) {
+    const v = Number(vec[i]) || 0;
+    normSq += v * v;
+  }
+  const norm = Math.sqrt(normSq);
+  if (norm < 1e-12) return vec.map(() => 0);
+  return vec.map((v) => Number(((Number(v) || 0) / norm).toFixed(6)));
+}
+
+/**
+ * Deterministic 768-dim feature-hashed n-gram embedding fallback.
+ * Used when GEMINI_API_KEY is not present (e.g. unit tests / offline sandbox)
+ * so vector search and cosine similarity remain 100% functional and deterministic.
+ */
+export function deterministicLocalEmbedding(text: string, dim = EMBEDDING_DIM): number[] {
+  const vec = new Array<number>(dim).fill(0);
+  const normalized = String(text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9₹#@\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return vec;
+
+  const tokens = normalized.split(" ").filter(Boolean);
+  const features: Array<{ term: string; weight: number }> = [];
+
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    features.push({ term: `u:${t}`, weight: t.length >= 5 ? 1.5 : 1.0 });
+    if (i + 1 < tokens.length) {
+      features.push({ term: `b:${t}_${tokens[i + 1]}`, weight: 1.25 });
+    }
+    if (t.length >= 4) {
+      for (let j = 0; j <= t.length - 3; j++) {
+        features.push({ term: `c:${t.slice(j, j + 3)}`, weight: 0.45 });
+      }
+    }
+  }
+
+  for (const feat of features) {
+    const digest = createHash("sha256").update(feat.term).digest();
+    const idx = digest.readUInt16BE(0) % dim;
+    const sign = (digest[2] & 1) === 0 ? 1 : -1;
+    vec[idx] += sign * feat.weight;
+  }
+
+  return normalizeVector(vec);
+}
+
+/**
+ * Computes cosine similarity in [-1, 1] between two equal-length vectors.
+ */
+export function cosineSimilarity(a: number[] | null | undefined, b: number[] | null | undefined): number {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length === 0 || a.length !== b.length) {
+    return 0;
+  }
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    const va = Number(a[i]) || 0;
+    const vb = Number(b[i]) || 0;
+    dot += va * vb;
+    normA += va * va;
+    normB += vb * vb;
+  }
+  if (normA < 1e-12 || normB < 1e-12) return 0;
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+/**
+ * Computes a 768-dimensional embedding using Google Gemini (text-embedding-004 / gemini-embedding-001),
+ * with fallback to OpenAI text-embedding-3-small or deterministic local 768-dim embedding.
+ */
+export async function embedText(
+  text: string,
+  taskType: "RETRIEVAL_DOCUMENT" | "RETRIEVAL_QUERY" = "RETRIEVAL_DOCUMENT"
+): Promise<{ embedding: number[]; model: string }> {
+  const clean = String(text || "").trim().slice(0, 8000);
+  if (!clean) {
+    return {
+      embedding: new Array<number>(EMBEDDING_DIM).fill(0),
+      model: "empty",
+    };
+  }
+
+  const geminiKey = getGeminiApiKey();
+  if (geminiKey) {
+    for (const modelName of DEFAULT_GEMINI_EMBED_MODELS) {
+      try {
+        const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+          modelName
+        )}:embedContent`;
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": geminiKey,
+          },
+          body: JSON.stringify({
+            model: `models/${modelName}`,
+            content: { parts: [{ text: clean }] },
+            taskType,
+            outputDimensionality: EMBEDDING_DIM,
+          }),
+          signal: AbortSignal.timeout(15000),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as {
+            embedding?: { values?: number[] };
+          };
+          const values = data?.embedding?.values;
+          if (Array.isArray(values) && values.length > 0) {
+            const resized =
+              values.length >= EMBEDDING_DIM
+                ? values.slice(0, EMBEDDING_DIM)
+                : [...values, ...new Array(EMBEDDING_DIM - values.length).fill(0)];
+            return {
+              embedding: normalizeVector(resized),
+              model: modelName,
+            };
+          }
+        }
+      } catch {
+        // Try next Gemini embedding model or fall back cleanly
+      }
+    }
+  }
+
+  const openAiKey = getOpenAiApiKey();
+  if (openAiKey) {
+    try {
+      const res = await fetch("https://api.openai.com/v1/embeddings", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${openAiKey}`,
+        },
+        body: JSON.stringify({
+          model: "text-embedding-3-small",
+          input: clean,
+          dimensions: EMBEDDING_DIM,
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as {
+          data?: Array<{ embedding?: number[] }>;
+        };
+        const values = data?.data?.[0]?.embedding;
+        if (Array.isArray(values) && values.length === EMBEDDING_DIM) {
+          return {
+            embedding: normalizeVector(values),
+            model: "text-embedding-3-small",
+          };
+        }
+      }
+    } catch {
+      // Fall back to deterministic local embedding
+    }
+  }
+
+  return {
+    embedding: deterministicLocalEmbedding(clean, EMBEDDING_DIM),
+    model: "satmi-hashed-ngram-768",
+  };
+}
+
+function parseJsonFromLlmOutput<T>(rawText: string): T | null {
+  const trimmed = String(rawText || "").trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed) as T;
+  } catch {
+    const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fenced?.[1]) {
+      try {
+        return JSON.parse(fenced[1].trim()) as T;
+      } catch {
+        // continue
+      }
+    }
+    const firstBrace = trimmed.indexOf("{");
+    const lastBrace = trimmed.lastIndexOf("}");
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+      try {
+        return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1)) as T;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+/**
+ * Generates structured JSON using Google Gemini (gemini-2.5-flash),
+ * with optional OpenAI fallback and a guaranteed deterministic fallback function.
+ */
+export async function generateStructuredJson<T>(params: {
+  systemInstruction: string;
+  userPrompt: string;
+  temperature?: number;
+  fallback: () => T | Promise<T>;
+}): Promise<{
+  data: T;
+  provider: "gemini" | "openai" | "local_heuristic";
+  model: string;
+}> {
+  const temperature = params.temperature ?? 0.15;
+  const geminiKey = getGeminiApiKey();
+
+  if (geminiKey) {
+    const model = DEFAULT_GEMINI_CHAT_MODEL;
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      model
+    )}:generateContent`;
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": geminiKey,
+          },
+          body: JSON.stringify({
+            systemInstruction: {
+              parts: [{ text: params.systemInstruction }],
+            },
+            contents: [
+              {
+                role: "user",
+                parts: [{ text: params.userPrompt }],
+              },
+            ],
+            generationConfig: {
+              temperature,
+              responseMimeType: "application/json",
+            },
+          }),
+          signal: AbortSignal.timeout(20000),
+        });
+
+        if (res.status === 429 && attempt === 0) {
+          await new Promise((r) => setTimeout(r, 1200));
+          continue;
+        }
+
+        if (res.ok) {
+          const payload = (await res.json()) as {
+            candidates?: Array<{
+              content?: { parts?: Array<{ text?: string }> };
+            }>;
+          };
+          const rawText =
+            payload?.candidates?.[0]?.content?.parts
+              ?.map((p) => p.text || "")
+              .join("\n") || "";
+          const parsed = parseJsonFromLlmOutput<T>(rawText);
+          if (parsed !== null) {
+            return {
+              data: parsed,
+              provider: "gemini",
+              model,
+            };
+          }
+        }
+      } catch {
+        // Retry once on transient network/timeout error
+      }
+    }
+  }
+
+  const openAiKey = getOpenAiApiKey();
+  if (openAiKey) {
+    try {
+      const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${openAiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          temperature,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: params.systemInstruction },
+            { role: "user", content: params.userPrompt },
+          ],
+        }),
+        signal: AbortSignal.timeout(30000),
+      });
+      if (res.ok) {
+        const payload = (await res.json()) as {
+          choices?: Array<{ message?: { content?: string } }>;
+        };
+        const rawText = payload?.choices?.[0]?.message?.content || "";
+        const parsed = parseJsonFromLlmOutput<T>(rawText);
+        if (parsed !== null) {
+          return {
+            data: parsed,
+            provider: "openai",
+            model,
+          };
+        }
+      }
+    } catch {
+      // Fall through to deterministic fallback
+    }
+  }
+
+  return {
+    data: await params.fallback(),
+    provider: "local_heuristic",
+    model: "satmi-local-grounded-v1",
+  };
+}
