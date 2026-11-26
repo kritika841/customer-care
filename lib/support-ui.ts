@@ -353,6 +353,19 @@ export function formatCostUsd(costUsd: number): string {
   return `$${c.toFixed(3)}`;
 }
 
+export function formatChatModelLabel(model?: string | null): string {
+  const m = String(model || "").trim();
+  if (!m) return "AI Agent";
+  const lower = m.toLowerCase();
+  if (lower.includes("claude-haiku-5-5")) return "Claude Haiku 5.5";
+  if (lower.includes("claude-haiku-4-5")) return "Claude Haiku 4.5";
+  if (lower.includes("claude-haiku")) return "Claude Haiku";
+  if (lower.includes("gemini-2.5-flash")) return "Gemini 2.5 Flash";
+  if (lower.includes("gemini-3.5-flash-lite")) return "Gemini 3.5 Flash-Lite";
+  if (lower.includes("local")) return "Local Grounded Fallback";
+  return m;
+}
+
 export function formatCostInr(costUsd: number, usdToInr = 85): string {
   const inr = Math.max(0, Number(costUsd) || 0) * usdToInr;
   if (inr === 0) return "₹0.00";

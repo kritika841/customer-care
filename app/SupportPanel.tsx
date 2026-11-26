@@ -60,6 +60,7 @@ import {
   extractLegacyAttachmentUrls,
   fileToBase64Attachment,
   formatBytes,
+  formatChatModelLabel,
   formatCostInr,
   formatCostUsd,
   formatShortDate,
@@ -2528,6 +2529,10 @@ export default function SupportPanel({
 
       {canManage && !inTicketWorkspace && (
         <FloatingMemoryDock
+          modelLabel={formatChatModelLabel(
+            (data.aiSettings as { providerInfo?: { chatModel?: string } } | undefined)?.providerInfo
+              ?.chatModel,
+          )}
           memoryCount={Number(data.aiKnowledgeSummary?.adminMemoryCount || 0)}
           onMemoryUpdated={() => void load()}
           onOpenAiBrain={() => selectView("ai")}

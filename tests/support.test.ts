@@ -41,6 +41,8 @@ const {
   cosineSimilarity,
   generateStructuredJson,
   embedText,
+  resolveStrictAnthropicHaikuModel,
+  resetPaidBudgetTrackerForTests,
 } = await import("../lib/operations/ai-provider");
 const {
   chunkKnowledgeDocument,
@@ -1130,10 +1132,13 @@ test("Sparse hashed vector detector and Gemini provider retry/backoff on 429 & 5
   // Mock fetch to simulate 429 then 500 then 200 recovery
   const origFetch = globalThis.fetch;
   const prevKey = process.env.GEMINI_API_KEY;
+  const prevAiProvider = process.env.AI_PROVIDER;
   const prevRetryBase = process.env.AI_PROVIDER_RETRY_BASE_MS;
   let callCount = 0;
   let capturedBody = "";
   try {
+    resetPaidBudgetTrackerForTests();
+    process.env.AI_PROVIDER = "gemini";
     process.env.GEMINI_API_KEY = "test-mock-gemini-key";
     process.env.AI_PROVIDER_RETRY_BASE_MS = "10";
     globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
@@ -1200,11 +1205,148 @@ test("Sparse hashed vector detector and Gemini provider retry/backoff on 429 & 5
     assert.equal(embRes.model, "gemini-embedding-001");
     assert.equal(embRes.embedding.length, EMBEDDING_DIM);
   } finally {
+    resetPaidBudgetTrackerForTests();
     globalThis.fetch = origFetch;
     if (prevKey === undefined) delete process.env.GEMINI_API_KEY;
     else process.env.GEMINI_API_KEY = prevKey;
+    if (prevAiProvider === undefined) delete process.env.AI_PROVIDER;
+    else process.env.AI_PROVIDER = prevAiProvider;
     if (prevRetryBase === undefined) delete process.env.AI_PROVIDER_RETRY_BASE_MS;
     else process.env.AI_PROVIDER_RETRY_BASE_MS = prevRetryBase;
+  }
+});
+
+test("Strict Claude Haiku 5.5 model lock, prompt caching, and anti-overspend budget circuit breakers", async () => {
+  const prevModel = process.env.ANTHROPIC_MODEL;
+  const prevStrict = process.env.ANTHROPIC_STRICT_HAIKU;
+  const prevLegacy = process.env.ANTHROPIC_ALLOW_LEGACY_HAIKU;
+  const prevKey = process.env.ANTHROPIC_API_KEY;
+  const prevProvider = process.env.AI_PROVIDER;
+  const prevDbUrl = process.env.SUPABASE_DB_URL;
+  const prevDailyCap = process.env.AI_MAX_DAILY_USD;
+  const prevHourlyCap = process.env.AI_MAX_REQUESTS_PER_HOUR;
+  const prevTicketCap = process.env.AI_MAX_CALLS_PER_TICKET_24H;
+  const origFetch = globalThis.fetch;
+
+  try {
+    resetPaidBudgetTrackerForTests();
+    delete process.env.SUPABASE_DB_URL;
+    process.env.ANTHROPIC_STRICT_HAIKU = "true";
+    process.env.ANTHROPIC_ALLOW_LEGACY_HAIKU = "false";
+
+    // 1. Expensive Anthropic models must NEVER run — forced back to claude-haiku-5-5
+    assert.equal(resolveStrictAnthropicHaikuModel("claude-opus-5-5"), "claude-haiku-5-5");
+    assert.equal(resolveStrictAnthropicHaikuModel("claude-sonnet-5-5"), "claude-haiku-5-5");
+    assert.equal(resolveStrictAnthropicHaikuModel("claude-fable-5-2"), "claude-haiku-5-5");
+    assert.equal(resolveStrictAnthropicHaikuModel("claude-haiku-4-5-20251001"), "claude-haiku-5-5");
+    assert.equal(resolveStrictAnthropicHaikuModel("claude-haiku-5-5"), "claude-haiku-5-5");
+
+    // 2. Pricing calculation matches Claude Haiku 5.5 tiers including cache discounts
+    const haikuCost = estimateAiCostUsd("claude-haiku-5-5", 10_000, 1_000, {
+      cacheReadTokens: 20_000,
+      cacheWriteTokens: 4_000,
+    });
+    // 10k*0.10/1M (0.001) + 1k*0.50/1M (0.0005) + 20k*0.01/1M (0.0002) + 4k*0.125/1M (0.0005) = 0.0022
+    assert.equal(haikuCost, 0.0022);
+
+    // 3. Anthropic Messages API call omits deprecated `temperature`, disables adaptive thinking, enforces max_tokens & prompt caching
+    process.env.AI_PROVIDER = "anthropic";
+    process.env.ANTHROPIC_API_KEY = "sk-ant-test-mock-key-123456";
+    process.env.ANTHROPIC_MODEL = "claude-opus-5-5"; // attempt to force Opus
+    process.env.ANTHROPIC_MAX_OUTPUT_TOKENS = "1200";
+    process.env.AI_MAX_DAILY_USD = "0.001"; // very tight cap ($0.001)
+    process.env.AI_MAX_REQUESTS_PER_HOUR = "10";
+    process.env.AI_MAX_CALLS_PER_TICKET_24H = "2";
+
+    let apiCalls = 0;
+    let lastBody: Record<string, unknown> = {};
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      apiCalls++;
+      lastBody = JSON.parse(String(init?.body || "{}"));
+      return new Response(
+        JSON.stringify({
+          model: "claude-haiku-5-5",
+          content: [{ type: "text", text: '{"decision":"auto_reply","ok":true}' }],
+          usage: {
+            input_tokens: 4000,
+            cache_read_input_tokens: 1000,
+            cache_creation_input_tokens: 0,
+            output_tokens: 1500, // cost: 4k*0.1/1M + 1k*0.01/1M + 1.5k*0.5/1M = $0.00116 > $0.001 cap!
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const firstRes = await generateStructuredJson<{ decision: string; ok: boolean }>({
+      systemInstruction: "Satmi support instructions",
+      userPrompt: "Return JSON",
+      ticketId: "tkt_budget_1",
+      maxTokens: 9999, // must be clamped to <= 700
+      fallback: () => ({ decision: "fallback", ok: false }),
+    });
+
+    assert.equal(apiCalls, 1);
+    assert.equal(firstRes.provider, "anthropic");
+    assert.equal(firstRes.model, "claude-haiku-5-5");
+    assert.equal(lastBody.model, "claude-haiku-5-5");
+    assert.equal("temperature" in lastBody, false);
+    assert.deepEqual(lastBody.thinking, { type: "disabled" });
+    assert.ok(Number(lastBody.max_tokens) <= 1600);
+    assert.ok(Array.isArray(lastBody.system));
+
+    // Next call MUST trip the $0.001 daily spend cap and return local_heuristic WITHOUT making an HTTP request!
+    const blockedRes = await generateStructuredJson<{ decision: string; ok: boolean }>({
+      systemInstruction: "Satmi support instructions",
+      userPrompt: "Return JSON",
+      ticketId: "tkt_budget_2",
+      fallback: () => ({ decision: "budget_blocked", ok: false }),
+    });
+    assert.equal(apiCalls, 1, "Budget guard must block paid HTTP calls once daily cap is reached");
+    assert.equal(blockedRes.provider, "local_heuristic");
+    assert.match(blockedRes.model, /budget-guard/);
+    assert.equal(blockedRes.data.decision, "budget_blocked");
+
+    // 4. Per-ticket 24h cap prevents webhook/cron loops on a single ticket even with generous USD cap
+    resetPaidBudgetTrackerForTests();
+    process.env.AI_MAX_DAILY_USD = "5.00";
+    process.env.AI_MAX_CALLS_PER_TICKET_24H = "1";
+    await generateStructuredJson({
+      systemInstruction: "Sys",
+      userPrompt: "Q1",
+      ticketId: "tkt_loop_1",
+      fallback: () => ({ ok: false }),
+    });
+    const loopBlocked = await generateStructuredJson({
+      systemInstruction: "Sys",
+      userPrompt: "Q2",
+      ticketId: "tkt_loop_1",
+      fallback: () => ({ ok: false, loopGuarded: true }),
+    });
+    assert.equal(apiCalls, 2);
+    assert.equal(loopBlocked.provider, "local_heuristic");
+    assert.equal((loopBlocked.data as { loopGuarded?: boolean }).loopGuarded, true);
+  } finally {
+    resetPaidBudgetTrackerForTests();
+    globalThis.fetch = origFetch;
+    if (prevModel === undefined) delete process.env.ANTHROPIC_MODEL;
+    else process.env.ANTHROPIC_MODEL = prevModel;
+    if (prevStrict === undefined) delete process.env.ANTHROPIC_STRICT_HAIKU;
+    else process.env.ANTHROPIC_STRICT_HAIKU = prevStrict;
+    if (prevLegacy === undefined) delete process.env.ANTHROPIC_ALLOW_LEGACY_HAIKU;
+    else process.env.ANTHROPIC_ALLOW_LEGACY_HAIKU = prevLegacy;
+    if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevKey;
+    if (prevProvider === undefined) delete process.env.AI_PROVIDER;
+    else process.env.AI_PROVIDER = prevProvider;
+    if (prevDbUrl === undefined) delete process.env.SUPABASE_DB_URL;
+    else process.env.SUPABASE_DB_URL = prevDbUrl;
+    if (prevDailyCap === undefined) delete process.env.AI_MAX_DAILY_USD;
+    else process.env.AI_MAX_DAILY_USD = prevDailyCap;
+    if (prevHourlyCap === undefined) delete process.env.AI_MAX_REQUESTS_PER_HOUR;
+    else process.env.AI_MAX_REQUESTS_PER_HOUR = prevHourlyCap;
+    if (prevTicketCap === undefined) delete process.env.AI_MAX_CALLS_PER_TICKET_24H;
+    else process.env.AI_MAX_CALLS_PER_TICKET_24H = prevTicketCap;
   }
 });
 

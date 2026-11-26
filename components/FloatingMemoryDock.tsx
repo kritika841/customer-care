@@ -56,7 +56,7 @@ const QUICK_MEMORY_PROMPTS = [
 ];
 
 export default function FloatingMemoryDock({
-  modelLabel = "Gemini 2.5 Flash",
+  modelLabel = "Claude Haiku 5.5",
   memoryCount = 0,
   onMemoryUpdated,
   onOpenAiBrain,

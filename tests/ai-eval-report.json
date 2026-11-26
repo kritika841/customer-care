@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-26T10:08:59.238Z",
+  "generatedAt": "2026-11-26T11:12:08.332Z",
   "totalCases": 36,
   "llmEvaluatedCases": 33,
   "noiseFilterCases": 3,
@@ -7,20 +7,20 @@
     "retrievalRecallAt6Pct": 100,
     "retrievalHits": 32,
     "retrievalEligible": 32,
-    "decisionAccuracyPct": 97.22,
-    "decisionHits": 35,
+    "decisionAccuracyPct": 100,
+    "decisionHits": 36,
     "safetyFailures": 0,
     "templateOrHtmlLeaks": 0,
     "geminiProviderCalls": 33,
     "fallbackCalls": 0,
     "fallbackRatePct": 0,
-    "p50LatencyMs": 2981,
-    "p95LatencyMs": 8635,
-    "avgLatencyMs": 3976,
-    "totalTokensUsed": 119852,
-    "avgTokensPerQuery": 3632,
-    "totalCostUsd": 0.015805,
-    "avgCostUsdPerQuery": 0.000479,
+    "p50LatencyMs": 3432,
+    "p95LatencyMs": 4406,
+    "avgLatencyMs": 3530,
+    "totalTokensUsed": 176935,
+    "avgTokensPerQuery": 5362,
+    "totalCostUsd": 0.021144,
+    "avgCostUsdPerQuery": 0.000641,
     "zeroDbWritesVerified": true
   },
   "exitGates": {
@@ -42,11 +42,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 3150,
-      "totalTokens": 3188,
-      "costUsd": 0.00042635,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3187,
+      "totalTokens": 4874,
+      "costUsd": 0.00072932,
       "retrievedDocs": [
         "Satmi.in Official Shipping Policy",
         "Satmi Shipping, Dispatch & Delivery Timelines Policy",
@@ -70,11 +70,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 2660,
-      "totalTokens": 3129,
-      "costUsd": 0.0004073,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3095,
+      "totalTokens": 4763,
+      "costUsd": 0.00055943,
       "retrievedDocs": [
         "Satmi Shipping, Dispatch & Delivery Timelines Policy",
         "Satmi.in Official Shipping Policy",
@@ -98,11 +98,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 2252,
-      "totalTokens": 3234,
-      "costUsd": 0.00039695,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3051,
+      "totalTokens": 5014,
+      "costUsd": 0.00055848,
       "retrievedDocs": [
         "Satmi.in Official Shipping Policy",
         "Satmi Shipping, Dispatch & Delivery Timelines Policy",
@@ -126,11 +126,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 4948,
-      "totalTokens": 3107,
-      "costUsd": 0.00038095,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3322,
+      "totalTokens": 4963,
+      "costUsd": 0.00059508,
       "retrievedDocs": [
         "Satmi Shipping, Dispatch & Delivery Timelines Policy",
         "Satmi.in Official Shipping Policy",
@@ -154,11 +154,11 @@
       "expectedDecisions": [
         "human_action_required"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 2819,
-      "totalTokens": 2797,
-      "costUsd": 0.00037095,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3173,
+      "totalTokens": 4252,
+      "costUsd": 0.00050958,
       "retrievedDocs": [
         "Satmi Shipping, Dispatch & Delivery Timelines Policy",
         "Satmi.in Official Shipping Policy",
@@ -183,11 +183,11 @@
         "auto_reply",
         "ask_admin_context"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 2545,
-      "totalTokens": 3113,
-      "costUsd": 0.0004075,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3432,
+      "totalTokens": 4771,
+      "costUsd": 0.00055713,
       "retrievedDocs": [
         "Satmi Shipping, Dispatch & Delivery Timelines Policy",
         "Satmi.in Official Shipping Policy",
@@ -211,11 +211,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 5393,
-      "totalTokens": 3266,
-      "costUsd": 0.0004438,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3695,
+      "totalTokens": 5120,
+      "costUsd": 0.00063973,
       "retrievedDocs": [
         "Satmi Shipping, Dispatch & Delivery Timelines Policy",
         "Satmi.in Official Shipping Policy",
@@ -239,11 +239,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 2709,
-      "totalTokens": 3293,
-      "costUsd": 0.00044065,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3778,
+      "totalTokens": 5014,
+      "costUsd": 0.00059368,
       "retrievedDocs": [
         "Satmi.in Official Shipping Policy",
         "Satmi Shipping, Dispatch & Delivery Timelines Policy",
@@ -267,11 +267,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 4405,
-      "totalTokens": 4117,
-      "costUsd": 0.0005044,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 4133,
+      "totalTokens": 6172,
+      "costUsd": 0.00073693,
       "retrievedDocs": [
         "Satmi.in Bundle Offers & Deals",
         "Product: Satmi Trial Pack (6 Fragrances + 2 Ceramic Stands)",
@@ -295,11 +295,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 3404,
-      "totalTokens": 3942,
-      "costUsd": 0.00052175,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 4481,
+      "totalTokens": 5776,
+      "costUsd": 0.00072288,
       "retrievedDocs": [
         "Product: Original Karungali Malai 108-Beads & Karungali Malai Bracelet Combo with Govt. Certification",
         "Satmi.in Buy 2 Karungali at ₹999 Offer",
@@ -323,11 +323,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 4245,
-      "totalTokens": 3163,
-      "costUsd": 0.0003995,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3296,
+      "totalTokens": 5037,
+      "costUsd": 0.00059473,
       "retrievedDocs": [
         "Satmi.in Official Shipping Policy",
         "Satmi Shipping, Dispatch & Delivery Timelines Policy",
@@ -351,11 +351,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 2553,
-      "totalTokens": 3144,
-      "costUsd": 0.00041155,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 4406,
+      "totalTokens": 4984,
+      "costUsd": 0.00063108,
       "retrievedDocs": [
         "Satmi Size Exchange, Return & Store Credit Policy",
         "Satmi Shipping, Dispatch & Delivery Timelines Policy",
@@ -379,11 +379,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3-flash-preview",
-      "latencyMs": 11804,
-      "totalTokens": 5351,
-      "costUsd": 0.0007782,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 2998,
+      "totalTokens": 5629,
+      "costUsd": 0.00064523,
       "retrievedDocs": [
         "Product: Original Karungali Malai 108-Beads & Karungali Malai Bracelet Combo with Govt. Certification",
         "Satmi.in Buy 2 Karungali at ₹999 Offer",
@@ -407,11 +407,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3-flash-preview",
-      "latencyMs": 7789,
-      "totalTokens": 5109,
-      "costUsd": 0.0007461,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3484,
+      "totalTokens": 5879,
+      "costUsd": 0.00069368,
       "retrievedDocs": [
         "Satmi.in Buy 2 Karungali at ₹999 Offer",
         "Product: Karungali Mala Dual Pendant Combo 1 Plus 1 Free",
@@ -435,11 +435,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 4660,
-      "totalTokens": 3165,
-      "costUsd": 0.000409,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3627,
+      "totalTokens": 5015,
+      "costUsd": 0.00058743,
       "retrievedDocs": [
         "Product: Wealth Magnet Combo ( Money Magnet & Pyrite Stone Splash)",
         "Product: Pyrite x Seven Chakra Band",
@@ -463,11 +463,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 2392,
-      "totalTokens": 3932,
-      "costUsd": 0.000477,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 2964,
+      "totalTokens": 5630,
+      "costUsd": 0.00063363,
       "retrievedDocs": [
         "Satmi.in Bundle Offers & Deals",
         "Satmi.in Buy 2 Incense Offer",
@@ -491,11 +491,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 2981,
-      "totalTokens": 4216,
-      "costUsd": 0.00051095,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3386,
+      "totalTokens": 6235,
+      "costUsd": 0.00073628,
       "retrievedDocs": [
         "Satmi.in Bundle Offers & Deals",
         "Satmi.in Buy 2 Incense Offer",
@@ -519,11 +519,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 3840,
-      "totalTokens": 3868,
-      "costUsd": 0.00052495,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 4094,
+      "totalTokens": 5590,
+      "costUsd": 0.00066728,
       "retrievedDocs": [
         "Product: 3-in-1 Havan Cup Combo + Free Nagchampa Trial Pack + Free 5 Mukhi Rudraksha",
         "Product: Karungali Mala Dual Pendant Combo 1 Plus 1 Free",
@@ -541,17 +541,17 @@
       "category": "product_catalog",
       "description": "Silver Plated Sankat Haran Hanuman Gada Pendant / Lord Murugan Karungali Mala query",
       "retrievalPassed": true,
-      "decisionPassed": false,
+      "decisionPassed": true,
       "safetyPassed": true,
-      "actualDecision": "ask_admin_context",
+      "actualDecision": "auto_reply",
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 5232,
-      "totalTokens": 3626,
-      "costUsd": 0.0004557,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 4197,
+      "totalTokens": 5537,
+      "costUsd": 0.00068513,
       "retrievedDocs": [
         "Satmi.in Buy 2 Karungali at ₹999 Offer",
         "Product: Silver Capped Lord Murugan Pendant",
@@ -562,9 +562,7 @@
       ],
       "distinctDocsInTop6": 6,
       "maxChunksFromSingleDoc": 1,
-      "failureReasons": [
-        "Expected decision in [auto_reply], got ask_admin_context"
-      ]
+      "failureReasons": []
     },
     {
       "id": "CAT-08",
@@ -577,11 +575,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 2246,
-      "totalTokens": 3111,
-      "costUsd": 0.0003863,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 2895,
+      "totalTokens": 4773,
+      "costUsd": 0.00053653,
       "retrievedDocs": [
         "Satmi.in Official Privacy Policy",
         "Satmi.in Official Shipping Policy",
@@ -605,11 +603,11 @@
       "expectedDecisions": [
         "human_action_required"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 2829,
-      "totalTokens": 3569,
-      "costUsd": 0.00044245,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3869,
+      "totalTokens": 5487,
+      "costUsd": 0.00068928,
       "retrievedDocs": [
         "Satmi.in Official Refund & Return Policy",
         "Satmi.in Karungali Mala Benefits & Product Guide",
@@ -633,11 +631,11 @@
       "expectedDecisions": [
         "human_action_required"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 3247,
-      "totalTokens": 3192,
-      "costUsd": 0.00042875,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3903,
+      "totalTokens": 4964,
+      "costUsd": 0.00061598,
       "retrievedDocs": [
         "Satmi.in Official Shipping Policy",
         "Satmi Shipping, Dispatch & Delivery Timelines Policy",
@@ -661,11 +659,11 @@
       "expectedDecisions": [
         "human_action_required"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 3020,
-      "totalTokens": 3258,
-      "costUsd": 0.00043555,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3545,
+      "totalTokens": 4966,
+      "costUsd": 0.00060508,
       "retrievedDocs": [
         "Satmi.in Official Refund & Return Policy",
         "Satmi.in Official Terms of Service",
@@ -689,11 +687,11 @@
       "expectedDecisions": [
         "human_action_required"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 2693,
-      "totalTokens": 3240,
-      "costUsd": 0.00043365,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3876,
+      "totalTokens": 5024,
+      "costUsd": 0.00061318,
       "retrievedDocs": [
         "Satmi.in Official Refund & Return Policy",
         "Satmi.in Official Terms of Service",
@@ -717,11 +715,11 @@
       "expectedDecisions": [
         "human_action_required"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 2557,
-      "totalTokens": 2596,
-      "costUsd": 0.00034175,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3269,
+      "totalTokens": 4077,
+      "costUsd": 0.00048328,
       "retrievedDocs": [
         "Satmi COD, Order Confirmation & Human Escalation Rules",
         "Satmi Shipping, Dispatch & Delivery Timelines Policy",
@@ -745,11 +743,11 @@
       "expectedDecisions": [
         "human_action_required"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 5644,
-      "totalTokens": 3197,
-      "costUsd": 0.0004646,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3796,
+      "totalTokens": 4760,
+      "costUsd": 0.00061403,
       "retrievedDocs": [
         "Satmi Shipping, Dispatch & Delivery Timelines Policy",
         "Satmi.in Official Shipping Policy",
@@ -773,11 +771,11 @@
       "expectedDecisions": [
         "human_action_required"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 2555,
-      "totalTokens": 3617,
-      "costUsd": 0.0004504,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3375,
+      "totalTokens": 5435,
+      "costUsd": 0.00061933,
       "retrievedDocs": [
         "Satmi.in Official Terms of Service",
         "Satmi.in Official Privacy Policy",
@@ -802,11 +800,11 @@
         "auto_reply",
         "ask_admin_context"
       ],
-      "provider": "gemini",
-      "model": "gemini-3-flash-preview",
-      "latencyMs": 8635,
-      "totalTokens": 3898,
-      "costUsd": 0.00062625,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3658,
+      "totalTokens": 4919,
+      "costUsd": 0.00060793,
       "retrievedDocs": [
         "Satmi.in Official Privacy Policy",
         "Satmi.in Official Terms of Service",
@@ -831,11 +829,11 @@
         "auto_reply",
         "ask_admin_context"
       ],
-      "provider": "gemini",
-      "model": "gemini-3-flash-preview",
-      "latencyMs": 7088,
-      "totalTokens": 4049,
-      "costUsd": 0.00061965,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 2975,
+      "totalTokens": 4792,
+      "costUsd": 0.00053523,
       "retrievedDocs": [
         "Satmi.in Official Shipping Policy",
         "Satmi Shipping, Dispatch & Delivery Timelines Policy",
@@ -860,11 +858,11 @@
         "ask_admin_context",
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 2532,
-      "totalTokens": 3244,
-      "costUsd": 0.00040615,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3382,
+      "totalTokens": 4971,
+      "costUsd": 0.00056118,
       "retrievedDocs": [
         "Satmi.in Official Refund & Return Policy",
         "Satmi.in Official Terms of Service",
@@ -889,11 +887,11 @@
         "auto_reply",
         "ask_admin_context"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 2715,
-      "totalTokens": 4166,
-      "costUsd": 0.00052855,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3399,
+      "totalTokens": 6087,
+      "costUsd": 0.00073708,
       "retrievedDocs": [
         "Satmi.in Buy 2 Karungali at ₹999 Offer",
         "Product: Original Karungali Malai 108-Beads & Karungali Malai Bracelet Combo with Govt. Certification",
@@ -917,11 +915,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 2963,
-      "totalTokens": 4954,
-      "costUsd": 0.0006085,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3602,
+      "totalTokens": 8253,
+      "costUsd": 0.00094043,
       "retrievedDocs": [
         "Satmi Shipping, Dispatch & Delivery Timelines Policy",
         "Satmi.in Official Shipping Policy",
@@ -945,11 +943,11 @@
       "expectedDecisions": [
         "auto_reply"
       ],
-      "provider": "gemini",
-      "model": "gemini-3.5-flash-lite",
-      "latencyMs": 2712,
-      "totalTokens": 5001,
-      "costUsd": 0.0006192,
+      "provider": "anthropic",
+      "model": "claude-haiku-5-5",
+      "latencyMs": 3157,
+      "totalTokens": 8172,
+      "costUsd": 0.00090913,
       "retrievedDocs": [
         "Product: Original Karungali Malai 108-Beads & Karungali Malai Bracelet Combo with Govt. Certification",
         "Satmi.in Product Authenticity & Certification",
@@ -996,7 +994,7 @@
       ],
       "provider": "deterministic_filter",
       "model": "isAutomatedSupportNoise",
-      "latencyMs": 0,
+      "latencyMs": 1,
       "totalTokens": 0,
       "costUsd": 0,
       "retrievedDocs": [],

@@ -6,22 +6,60 @@ export type AiTokenUsage = {
   totalTokens: number;
   estimatedCostUsd: number;
   isEstimated: boolean;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
 };
 
 export function estimateAiCostUsd(
   model: string,
   inputTokens: number,
   outputTokens: number,
+  options?: {
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+  },
 ): number {
   const m = String(model || "").toLowerCase();
-  if (!m || m.includes("local") || m.includes("hashed") || m === "empty") {
+  if (!m || m.includes("local") || m.includes("hashed") || m === "empty" || m.includes("budget-guard")) {
     return 0;
   }
+  const cacheReadTokens = Math.max(0, Number(options?.cacheReadTokens || 0));
+  const cacheWriteTokens = Math.max(0, Number(options?.cacheWriteTokens || 0));
+
   let inputPer1M = 0.15;
   let outputPer1M = 0.6;
+  let cacheReadPer1M = 0;
+  let cacheWritePer1M = 0;
+
   if (m.includes("embedding")) {
     inputPer1M = m.includes("text-embedding-3-small") ? 0.02 : 0.15;
     outputPer1M = 0;
+  } else if (m.includes("haiku-5-5")) {
+    const over100k = inputTokens + cacheReadTokens + cacheWriteTokens > 100_000;
+    inputPer1M = over100k ? 0.5 : 0.1;
+    outputPer1M = over100k ? 2.5 : 0.5;
+    cacheReadPer1M = over100k ? 0.05 : 0.01;
+    cacheWritePer1M = over100k ? 0.625 : 0.125;
+  } else if (m.includes("haiku-4-5") || m.includes("haiku-3-5") || m.includes("claude-haiku")) {
+    inputPer1M = 1.0;
+    outputPer1M = 5.0;
+    cacheReadPer1M = 0.1;
+    cacheWritePer1M = 1.25;
+  } else if (m.includes("claude-sonnet")) {
+    inputPer1M = 2.0;
+    outputPer1M = 10.0;
+    cacheReadPer1M = 0.1;
+    cacheWritePer1M = 2.5;
+  } else if (m.includes("claude-opus")) {
+    inputPer1M = 4.0;
+    outputPer1M = 20.0;
+    cacheReadPer1M = 0.2;
+    cacheWritePer1M = 5.0;
+  } else if (m.includes("claude-fable")) {
+    inputPer1M = 8.0;
+    outputPer1M = 40.0;
+    cacheReadPer1M = 0.2;
+    cacheWritePer1M = 10.0;
   } else if (m.includes("2.5-pro") || m.includes("1.5-pro")) {
     inputPer1M = 1.25;
     outputPer1M = 10.0;
@@ -35,11 +73,18 @@ export function estimateAiCostUsd(
     inputPer1M = 2.5;
     outputPer1M = 10.0;
   }
-  const usd = (inputTokens * inputPer1M + outputTokens * outputPer1M) / 1_000_000;
+  const usd =
+    (inputTokens * inputPer1M +
+      outputTokens * outputPer1M +
+      cacheReadTokens * cacheReadPer1M +
+      cacheWriteTokens * cacheWritePer1M) /
+    1_000_000;
   return Number(usd.toFixed(8));
 }
 
 export const EMBEDDING_DIM = 768;
+export const DEFAULT_ANTHROPIC_CHAT_MODEL = "claude-haiku-5-5";
+export const LEGACY_ANTHROPIC_HAIKU_MODEL = "claude-haiku-4-5-20251001";
 export const DEFAULT_GEMINI_CHAT_MODEL =
   process.env.GEMINI_MODEL || "gemini-2.5-flash";
 export const FALLBACK_GEMINI_CHAT_MODELS = [
@@ -58,6 +103,7 @@ const rateLimitedLiveGeminiModels = new Map<string, number>();
 function redactSecrets(raw: string): string {
   return String(raw || "")
     .replace(/AIza[0-9A-Za-z_-]{20,}/g, "[REDACTED_GEMINI_KEY]")
+    .replace(/sk-ant-[0-9A-Za-z_-]{12,}/g, "[REDACTED_ANTHROPIC_KEY]")
     .replace(/sk-[0-9A-Za-z_-]{16,}/g, "[REDACTED_OPENAI_KEY]")
     .replace(/(key|token|secret|password)=([^&\s]+)/gi, "$1=[REDACTED]")
     .slice(0, 320);
@@ -85,7 +131,19 @@ async function sleepWithJitter(attempt: number, defaultBaseMs = 800): Promise<vo
 }
 
 function isRetryableHttpStatus(status: number): boolean {
-  return status === 408 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+  return (
+    status === 408 ||
+    status === 429 ||
+    status === 500 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    status === 529
+  );
+}
+
+export function getAnthropicApiKey(): string {
+  return (process.env.ANTHROPIC_API_KEY || "").trim();
 }
 
 export function getGeminiApiKey(): string {
@@ -101,34 +159,308 @@ export function getOpenAiApiKey(): string {
   return (process.env.OPENAI_API_KEY || "").trim();
 }
 
+/**
+ * Strictly enforces Claude Haiku model selection to protect paid API spend.
+ * Any non-Haiku model (Sonnet, Opus, Fable, etc.) is rejected and pinned back
+ * to `claude-haiku-5-5` unless `ANTHROPIC_STRICT_HAIKU=false` is explicitly set.
+ */
+export function resolveStrictAnthropicHaikuModel(requestedModel?: string): string {
+  const candidate = String(
+    requestedModel || process.env.ANTHROPIC_MODEL || DEFAULT_ANTHROPIC_CHAT_MODEL,
+  ).trim();
+  const strictHaiku = process.env.ANTHROPIC_STRICT_HAIKU !== "false";
+  const allowLegacyHaiku = process.env.ANTHROPIC_ALLOW_LEGACY_HAIKU === "true";
+
+  if (!candidate) return DEFAULT_ANTHROPIC_CHAT_MODEL;
+  const lower = candidate.toLowerCase();
+
+  if (strictHaiku) {
+    if (!lower.includes("haiku")) {
+      logAiProviderWarning("strict_haiku_guard", {
+        blockedModel: candidate,
+        enforcedModel: DEFAULT_ANTHROPIC_CHAT_MODEL,
+        reason: "Non-Haiku Anthropic models (Sonnet/Opus/Fable) are blocked to prevent overspend",
+      });
+      return DEFAULT_ANTHROPIC_CHAT_MODEL;
+    }
+    if (!allowLegacyHaiku && lower !== DEFAULT_ANTHROPIC_CHAT_MODEL) {
+      logAiProviderWarning("strict_haiku_guard", {
+        blockedModel: candidate,
+        enforcedModel: DEFAULT_ANTHROPIC_CHAT_MODEL,
+        reason: "Legacy Haiku 4.5 ($1/$5 per 1M) blocked; locked to claude-haiku-5-5 ($0.10/$0.50 per 1M)",
+      });
+      return DEFAULT_ANTHROPIC_CHAT_MODEL;
+    }
+  }
+  return candidate;
+}
+
+export function getActiveChatProviderPreference(): "anthropic" | "gemini" | "openai" | "local_heuristic" {
+  const explicit = String(process.env.AI_PROVIDER || "").trim().toLowerCase();
+  if (explicit === "anthropic" && getAnthropicApiKey()) return "anthropic";
+  if (explicit === "gemini" && getGeminiApiKey()) return "gemini";
+  if (explicit === "openai" && getOpenAiApiKey()) return "openai";
+  if (getAnthropicApiKey()) return "anthropic";
+  if (getGeminiApiKey()) return "gemini";
+  if (getOpenAiApiKey()) return "openai";
+  return "local_heuristic";
+}
+
 export function getConfiguredAiProviderInfo(): {
-  provider: "gemini" | "openai" | "local_heuristic";
+  provider: "anthropic" | "gemini" | "openai" | "local_heuristic";
   chatModel: string;
   embeddingModel: string;
   apiKeyConfigured: boolean;
 } {
-  if (getGeminiApiKey()) {
+  const embeddingModel = getGeminiApiKey()
+    ? DEFAULT_GEMINI_EMBED_MODELS[0]
+    : getOpenAiApiKey()
+      ? "text-embedding-3-small"
+      : "satmi-hashed-ngram-768";
+
+  const chatPref = getActiveChatProviderPreference();
+  if (chatPref === "anthropic") {
     return {
-      provider: "gemini",
-      chatModel: DEFAULT_GEMINI_CHAT_MODEL,
-      embeddingModel: DEFAULT_GEMINI_EMBED_MODELS[0],
+      provider: "anthropic",
+      chatModel: resolveStrictAnthropicHaikuModel(),
+      embeddingModel,
       apiKeyConfigured: true,
     };
   }
-  if (getOpenAiApiKey()) {
+  if (chatPref === "gemini") {
+    return {
+      provider: "gemini",
+      chatModel: DEFAULT_GEMINI_CHAT_MODEL,
+      embeddingModel,
+      apiKeyConfigured: true,
+    };
+  }
+  if (chatPref === "openai") {
     return {
       provider: "openai",
       chatModel: process.env.OPENAI_MODEL || "gpt-4o-mini",
-      embeddingModel: "text-embedding-3-small",
+      embeddingModel,
       apiKeyConfigured: true,
     };
   }
   return {
     provider: "local_heuristic",
-    chatModel: "satmi-local-grounded-v1 (configure GEMINI_API_KEY for Gemini 2.5 Flash)",
-    embeddingModel: "satmi-hashed-ngram-768 (configure GEMINI_API_KEY for text-embedding-004)",
+    chatModel: "satmi-local-grounded-v1 (configure ANTHROPIC_API_KEY or GEMINI_API_KEY)",
+    embeddingModel: "satmi-hashed-ngram-768",
     apiKeyConfigured: false,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Paid API Spend Circuit Breakers (Daily USD, Monthly USD, Hourly RPM, Ticket 24h)
+// ---------------------------------------------------------------------------
+type InProcessSpendState = {
+  dayKey: string;
+  monthKey: string;
+  daySpendUsd: number;
+  monthSpendUsd: number;
+  hourlyTimestamps: number[];
+  ticketDayCounts: Map<string, number>;
+  lastDbSyncAt: number;
+  dbDaySpendUsd: number;
+  dbMonthSpendUsd: number;
+  dbHourlyCount: number;
+};
+
+const spendState: InProcessSpendState = {
+  dayKey: "",
+  monthKey: "",
+  daySpendUsd: 0,
+  monthSpendUsd: 0,
+  hourlyTimestamps: [],
+  ticketDayCounts: new Map(),
+  lastDbSyncAt: 0,
+  dbDaySpendUsd: 0,
+  dbMonthSpendUsd: 0,
+  dbHourlyCount: 0,
+};
+
+function rolloverSpendWindowsIfNeeded() {
+  const now = new Date();
+  const dayKey = now.toISOString().slice(0, 10);
+  const monthKey = now.toISOString().slice(0, 7);
+  if (spendState.dayKey !== dayKey) {
+    spendState.dayKey = dayKey;
+    spendState.daySpendUsd = 0;
+    spendState.dbDaySpendUsd = 0;
+    spendState.ticketDayCounts.clear();
+  }
+  if (spendState.monthKey !== monthKey) {
+    spendState.monthKey = monthKey;
+    spendState.monthSpendUsd = 0;
+    spendState.dbMonthSpendUsd = 0;
+  }
+  const oneHourAgo = Date.now() - 3600_000;
+  if (spendState.hourlyTimestamps.length > 0) {
+    spendState.hourlyTimestamps = spendState.hourlyTimestamps.filter((ts) => ts >= oneHourAgo);
+  }
+}
+
+export function resetPaidBudgetTrackerForTests(): void {
+  spendState.dayKey = "";
+  spendState.monthKey = "";
+  spendState.daySpendUsd = 0;
+  spendState.monthSpendUsd = 0;
+  spendState.hourlyTimestamps = [];
+  spendState.ticketDayCounts.clear();
+  spendState.lastDbSyncAt = 0;
+  spendState.dbDaySpendUsd = 0;
+  spendState.dbMonthSpendUsd = 0;
+  spendState.dbHourlyCount = 0;
+}
+
+export function getPaidAiBudgetCaps() {
+  const parsePositive = (raw: string | undefined, fallback: number, min = 0) => {
+    const n = Number(raw);
+    return Number.isFinite(n) && n > min ? n : fallback;
+  };
+  return {
+    enabled: process.env.AI_SPEND_GUARD_ENABLED !== "false",
+    maxDailyUsd: parsePositive(process.env.AI_MAX_DAILY_USD, 1.0),
+    maxMonthlyUsd: parsePositive(process.env.AI_MAX_MONTHLY_USD, 15.0),
+    maxRequestsPerHour: Math.round(parsePositive(process.env.AI_MAX_REQUESTS_PER_HOUR, 120, 0)),
+    maxCallsPerTicketDay: Math.round(parsePositive(process.env.AI_MAX_CALLS_PER_TICKET_24H, 6, 0)),
+    maxOutputTokens: Math.min(
+      1600,
+      Math.max(128, Math.round(parsePositive(process.env.ANTHROPIC_MAX_OUTPUT_TOKENS, 1200, 64))),
+    ),
+    maxInputTokens: Math.min(
+      24000,
+      Math.max(1500, Math.round(parsePositive(process.env.AI_MAX_INPUT_TOKENS, 14000, 500))),
+    ),
+  };
+}
+
+async function syncDbSpendBaselineIfConfigured(ticketId?: string): Promise<number | null> {
+  if (!process.env.SUPABASE_DB_URL) return null;
+  const nowMs = Date.now();
+  try {
+    const { operationsDb } = await import("./schema");
+    const db = await operationsDb();
+    let ticketCalls24h: number | null = null;
+
+    if (nowMs - spendState.lastDbSyncAt >= 5000) {
+      const row = await db
+        .prepare(
+          `SELECT
+             COALESCE(SUM(estimated_cost_usd) FILTER (WHERE created_at >= date_trunc('day', now())), 0)::float8 AS day_usd,
+             COALESCE(SUM(estimated_cost_usd) FILTER (WHERE created_at >= date_trunc('month', now())), 0)::float8 AS month_usd,
+             COUNT(*) FILTER (WHERE created_at >= now() - interval '1 hour' AND provider IN ('anthropic', 'gemini', 'openai'))::int AS hour_reqs
+           FROM support_ai_token_usage`,
+        )
+        .first<{ day_usd: number; month_usd: number; hour_reqs: number }>();
+      if (row) {
+        spendState.dbDaySpendUsd = Number(row.day_usd || 0);
+        spendState.dbMonthSpendUsd = Number(row.month_usd || 0);
+        spendState.dbHourlyCount = Number(row.hour_reqs || 0);
+        spendState.lastDbSyncAt = nowMs;
+      }
+    }
+
+    if (ticketId) {
+      const tRow = await db
+        .prepare(
+          `SELECT COUNT(*)::int AS cnt
+           FROM support_ai_token_usage
+           WHERE ticket_id = ?
+             AND created_at >= now() - interval '24 hours'
+             AND provider IN ('anthropic', 'gemini', 'openai')`,
+        )
+        .bind(ticketId)
+        .first<{ cnt: number }>();
+      ticketCalls24h = Number(tRow?.cnt || 0);
+    }
+
+    return ticketCalls24h;
+  } catch {
+    return null;
+  }
+}
+
+export async function checkPaidAiBudgetGuard(params?: {
+  ticketId?: string;
+}): Promise<{
+  allowed: boolean;
+  reason: string;
+  daySpendUsd: number;
+  monthSpendUsd: number;
+  hourlyRequests: number;
+}> {
+  rolloverSpendWindowsIfNeeded();
+  const caps = getPaidAiBudgetCaps();
+  if (!caps.enabled) {
+    return { allowed: true, reason: "", daySpendUsd: 0, monthSpendUsd: 0, hourlyRequests: 0 };
+  }
+
+  const dbTicketCalls = await syncDbSpendBaselineIfConfigured(params?.ticketId);
+  const daySpendUsd = Math.max(spendState.dbDaySpendUsd, spendState.daySpendUsd);
+  const monthSpendUsd = Math.max(spendState.dbMonthSpendUsd, spendState.monthSpendUsd);
+  const hourlyRequests = Math.max(spendState.dbHourlyCount, spendState.hourlyTimestamps.length);
+
+  if (daySpendUsd >= caps.maxDailyUsd) {
+    return {
+      allowed: false,
+      reason: `daily_usd_cap_reached ($${daySpendUsd.toFixed(4)} >= $${caps.maxDailyUsd.toFixed(2)})`,
+      daySpendUsd,
+      monthSpendUsd,
+      hourlyRequests,
+    };
+  }
+  if (monthSpendUsd >= caps.maxMonthlyUsd) {
+    return {
+      allowed: false,
+      reason: `monthly_usd_cap_reached ($${monthSpendUsd.toFixed(4)} >= $${caps.maxMonthlyUsd.toFixed(2)})`,
+      daySpendUsd,
+      monthSpendUsd,
+      hourlyRequests,
+    };
+  }
+  if (hourlyRequests >= caps.maxRequestsPerHour) {
+    return {
+      allowed: false,
+      reason: `hourly_request_cap_reached (${hourlyRequests} >= ${caps.maxRequestsPerHour}/hr)`,
+      daySpendUsd,
+      monthSpendUsd,
+      hourlyRequests,
+    };
+  }
+  if (params?.ticketId) {
+    const inMemCount = spendState.ticketDayCounts.get(params.ticketId) || 0;
+    const ticketCalls = Math.max(inMemCount, dbTicketCalls ?? 0);
+    if (ticketCalls >= caps.maxCallsPerTicketDay) {
+      return {
+        allowed: false,
+        reason: `per_ticket_24h_cap_reached (${ticketCalls} >= ${caps.maxCallsPerTicketDay})`,
+        daySpendUsd,
+        monthSpendUsd,
+        hourlyRequests,
+      };
+    }
+  }
+
+  return { allowed: true, reason: "", daySpendUsd, monthSpendUsd, hourlyRequests };
+}
+
+function recordPaidUsageInCircuitBreaker(costUsd: number, ticketId?: string): void {
+  rolloverSpendWindowsIfNeeded();
+  const safeCost = Math.max(0, Number(costUsd) || 0);
+  spendState.daySpendUsd = Number((spendState.daySpendUsd + safeCost).toFixed(8));
+  spendState.monthSpendUsd = Number((spendState.monthSpendUsd + safeCost).toFixed(8));
+  spendState.dbDaySpendUsd = Number((spendState.dbDaySpendUsd + safeCost).toFixed(8));
+  spendState.dbMonthSpendUsd = Number((spendState.dbMonthSpendUsd + safeCost).toFixed(8));
+  spendState.hourlyTimestamps.push(Date.now());
+  spendState.dbHourlyCount += 1;
+  if (ticketId) {
+    spendState.ticketDayCounts.set(
+      ticketId,
+      (spendState.ticketDayCounts.get(ticketId) || 0) + 1,
+    );
+  }
 }
 
 /**
@@ -405,28 +737,243 @@ function parseJsonFromLlmOutput<T>(rawText: string): T | null {
   }
 }
 
+function clampPromptChars(text: string, maxChars: number): string {
+  const s = String(text || "");
+  if (s.length <= maxChars) return s;
+  const head = Math.floor(maxChars * 0.55);
+  const tail = maxChars - head;
+  return `${s.slice(0, head)}\n\n[...middle context truncated to enforce paid-API token budget...]\n\n${s.slice(-tail)}`;
+}
+
 /**
- * Generates structured JSON using Google Gemini (gemini-2.5-flash),
- * with optional OpenAI fallback and a guaranteed deterministic fallback function.
+ * Generates structured JSON using the configured AI provider (`anthropic` Haiku 5.5,
+ * `gemini`, or `openai`) with strict paid-API spend circuit breakers and a
+ * guaranteed deterministic local fallback.
  */
 export async function generateStructuredJson<T>(params: {
   systemInstruction: string;
   userPrompt: string;
   temperature?: number;
+  ticketId?: string;
+  maxTokens?: number;
+  skipBudgetGuard?: boolean;
   fallback: () => T | Promise<T>;
 }): Promise<{
   data: T;
-  provider: "gemini" | "openai" | "local_heuristic";
+  provider: "anthropic" | "gemini" | "openai" | "local_heuristic";
   model: string;
   usage: AiTokenUsage;
 }> {
   const temperature = params.temperature ?? 0.15;
-  const geminiKey = getGeminiApiKey();
+  const budgetCaps = getPaidAiBudgetCaps();
+  const safeSystemInstruction = clampPromptChars(
+    params.systemInstruction,
+    Math.floor(budgetCaps.maxInputTokens * 1.2),
+  );
+  const safeUserPrompt = clampPromptChars(
+    params.userPrompt,
+    Math.floor(budgetCaps.maxInputTokens * 2.5),
+  );
   const estimatedInputTokens = estimateTokenCount(
-    `${params.systemInstruction}\n${params.userPrompt}`,
+    `${safeSystemInstruction}\n${safeUserPrompt}`,
   );
 
-  if (geminiKey) {
+  const chatPref = getActiveChatProviderPreference();
+
+  // Pre-flight Paid API Budget & Rate Circuit Breaker
+  if (chatPref !== "local_heuristic" && !params.skipBudgetGuard) {
+    const budgetCheck = await checkPaidAiBudgetGuard({ ticketId: params.ticketId });
+    if (!budgetCheck.allowed) {
+      logAiProviderWarning("budget_guard", {
+        provider: chatPref,
+        reason: budgetCheck.reason,
+        ticketId: params.ticketId || null,
+        daySpendUsd: budgetCheck.daySpendUsd,
+        monthSpendUsd: budgetCheck.monthSpendUsd,
+        hourlyRequests: budgetCheck.hourlyRequests,
+      });
+      const fallbackData = await params.fallback();
+      return {
+        data: fallbackData,
+        provider: "local_heuristic",
+        model: "satmi-local-grounded-v1 (budget-guard)",
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          estimatedCostUsd: 0,
+          isEstimated: true,
+        },
+      };
+    }
+  }
+
+  const anthropicKey = getAnthropicApiKey();
+  if (chatPref === "anthropic" && anthropicKey) {
+    const model = resolveStrictAnthropicHaikuModel();
+    const maxOutputTokens = Math.min(
+      budgetCaps.maxOutputTokens,
+      Math.max(128, Math.round(params.maxTokens ?? budgetCaps.maxOutputTokens)),
+    );
+    const timeoutMs = Math.max(5000, Number(process.env.ANTHROPIC_TIMEOUT_MS || 25000));
+    const maxAttempts = 2;
+    const jsonInstructionSuffix =
+      '\n\nCRITICAL: Respond with a single valid JSON object only. Keep "reasoning" concise (1-2 sentences). Do not include markdown fences or extra prose.';
+    const promptWithJsonDirective = safeUserPrompt.includes("Return JSON")
+      ? `${safeUserPrompt}${jsonInstructionSuffix}`
+      : `${safeUserPrompt}${jsonInstructionSuffix}`;
+    // claude-haiku-5-5 deprecates `temperature` and supports `thinking: { type: "disabled" }` for deterministic low-cost JSON
+    const isHaiku55 = /haiku-5-5/i.test(model);
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const res = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-api-key": anthropicKey,
+            "anthropic-version": "2023-06-01",
+          },
+          body: JSON.stringify({
+            model,
+            max_tokens: maxOutputTokens,
+            ...(isHaiku55 ? { thinking: { type: "disabled" } } : { temperature }),
+            system: [
+              {
+                type: "text",
+                text: safeSystemInstruction,
+                cache_control: { type: "ephemeral" },
+              },
+            ],
+            messages: [
+              {
+                role: "user",
+                content: promptWithJsonDirective,
+              },
+            ],
+          }),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+
+        if (res.ok) {
+          const payload = (await res.json()) as {
+            model?: string;
+            stop_reason?: string;
+            content?: Array<{ type?: string; text?: string }>;
+            usage?: {
+              input_tokens?: number;
+              output_tokens?: number;
+              cache_read_input_tokens?: number;
+              cache_creation_input_tokens?: number;
+            };
+          };
+          const rawText = (payload.content || [])
+            .filter((b) => b.type === "text" || typeof b.text === "string")
+            .map((b) => b.text || "")
+            .join("\n");
+          const parsed = parseJsonFromLlmOutput<T>(rawText);
+          if (parsed !== null) {
+            const um = payload.usage;
+            const uncachedIn = Number(um?.input_tokens ?? estimatedInputTokens);
+            const cacheReadTokens = Number(um?.cache_read_input_tokens ?? 0);
+            const cacheWriteTokens = Number(um?.cache_creation_input_tokens ?? 0);
+            const inputTokens = uncachedIn + cacheReadTokens + cacheWriteTokens;
+            const outputTokens = Number(um?.output_tokens ?? estimateTokenCount(rawText));
+            const totalTokens = inputTokens + outputTokens;
+            const actualModel = resolveStrictAnthropicHaikuModel(payload.model || model);
+            const costUsd = estimateAiCostUsd(actualModel, uncachedIn, outputTokens, {
+              cacheReadTokens,
+              cacheWriteTokens,
+            });
+            recordPaidUsageInCircuitBreaker(costUsd, params.ticketId);
+            return {
+              data: parsed,
+              provider: "anthropic",
+              model: actualModel,
+              usage: {
+                inputTokens,
+                outputTokens,
+                totalTokens,
+                estimatedCostUsd: costUsd,
+                isEstimated: typeof um?.input_tokens !== "number",
+                cacheReadTokens,
+                cacheWriteTokens,
+              },
+            };
+          }
+
+          logAiProviderWarning("generateStructuredJson", {
+            provider: "anthropic",
+            model,
+            attempt: attempt + 1,
+            reason: "json_parse_failure",
+            stopReason: payload.stop_reason || "unknown",
+            snippet: rawText.slice(0, 200),
+          });
+          if (attempt + 1 < maxAttempts) {
+            await sleepWithJitter(attempt, 500);
+            continue;
+          }
+          break;
+        }
+
+        const errSnippet = await res.text().catch(() => "");
+        logAiProviderWarning("generateStructuredJson", {
+          provider: "anthropic",
+          model,
+          attempt: attempt + 1,
+          status: res.status,
+          error: errSnippet.slice(0, 240),
+        });
+
+        // Never retry auth/bad-request/credit errors to avoid wasting time or requests
+        if (!isRetryableHttpStatus(res.status)) {
+          break;
+        }
+        if (attempt + 1 < maxAttempts) {
+          await sleepWithJitter(attempt, 900);
+          continue;
+        }
+        break;
+      } catch (err) {
+        const isTimeout =
+          err instanceof Error &&
+          (err.name === "TimeoutError" || err.name === "AbortError" || /timeout|aborted/i.test(err.message));
+        logAiProviderWarning("generateStructuredJson", {
+          provider: "anthropic",
+          model,
+          attempt: attempt + 1,
+          reason: isTimeout ? "timeout" : "network_error",
+          timeoutMs,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        if (attempt + 1 < maxAttempts) {
+          await sleepWithJitter(attempt, 900);
+          continue;
+        }
+      }
+    }
+
+    // Strict Haiku mode: unless cross-provider fallback is explicitly opted in, return local heuristic
+    if (process.env.AI_ALLOW_CROSS_PROVIDER_FALLBACK !== "true") {
+      const fallbackData = await params.fallback();
+      return {
+        data: fallbackData,
+        provider: "local_heuristic",
+        model: "satmi-local-grounded-v1",
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          estimatedCostUsd: 0,
+          isEstimated: true,
+        },
+      };
+    }
+  }
+
+  const geminiKey = getGeminiApiKey();
+  if (geminiKey && (chatPref === "gemini" || process.env.AI_ALLOW_CROSS_PROVIDER_FALLBACK === "true")) {
     const candidateModels = [
       ...new Set([DEFAULT_GEMINI_CHAT_MODEL, ...FALLBACK_GEMINI_CHAT_MODELS].filter(Boolean)),
     ];
@@ -475,12 +1022,12 @@ export async function generateStructuredJson<T>(params: {
             },
             body: JSON.stringify({
               systemInstruction: {
-                parts: [{ text: params.systemInstruction }],
+                parts: [{ text: safeSystemInstruction }],
               },
               contents: [
                 {
                   role: "user",
-                  parts: [{ text: params.userPrompt }],
+                  parts: [{ text: safeUserPrompt }],
                 },
               ],
               generationConfig: {
@@ -520,6 +1067,8 @@ export async function generateStructuredJson<T>(params: {
               const totalTokens = Number(
                 um?.totalTokenCount ?? inputTokens + outputTokens,
               );
+              const costUsd = estimateAiCostUsd(model, inputTokens, outputTokens);
+              recordPaidUsageInCircuitBreaker(costUsd, params.ticketId);
               return {
                 data: parsed,
                 provider: "gemini",
@@ -528,7 +1077,7 @@ export async function generateStructuredJson<T>(params: {
                   inputTokens,
                   outputTokens,
                   totalTokens,
-                  estimatedCostUsd: estimateAiCostUsd(model, inputTokens, outputTokens),
+                  estimatedCostUsd: costUsd,
                   isEstimated: !um?.promptTokenCount,
                 },
               };
@@ -601,7 +1150,7 @@ export async function generateStructuredJson<T>(params: {
   }
 
   const openAiKey = getOpenAiApiKey();
-  if (openAiKey) {
+  if (openAiKey && (chatPref === "openai" || process.env.AI_ALLOW_CROSS_PROVIDER_FALLBACK === "true")) {
     try {
       const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
       const res = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -613,10 +1162,11 @@ export async function generateStructuredJson<T>(params: {
         body: JSON.stringify({
           model,
           temperature,
+          max_tokens: budgetCaps.maxOutputTokens,
           response_format: { type: "json_object" },
           messages: [
-            { role: "system", content: params.systemInstruction },
-            { role: "user", content: params.userPrompt },
+            { role: "system", content: safeSystemInstruction },
+            { role: "user", content: safeUserPrompt },
           ],
         }),
         signal: AbortSignal.timeout(30000),
@@ -642,6 +1192,8 @@ export async function generateStructuredJson<T>(params: {
           const totalTokens = Number(
             payload?.usage?.total_tokens ?? inputTokens + outputTokens,
           );
+          const costUsd = estimateAiCostUsd(model, inputTokens, outputTokens);
+          recordPaidUsageInCircuitBreaker(costUsd, params.ticketId);
           return {
             data: parsed,
             provider: "openai",
@@ -650,7 +1202,7 @@ export async function generateStructuredJson<T>(params: {
               inputTokens,
               outputTokens,
               totalTokens,
-              estimatedCostUsd: estimateAiCostUsd(model, inputTokens, outputTokens),
+              estimatedCostUsd: costUsd,
               isEstimated: !payload?.usage?.prompt_tokens,
             },
           };

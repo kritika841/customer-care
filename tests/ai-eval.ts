@@ -903,7 +903,7 @@ await withRequestDatabase(async () => {
     totalTokensUsed += queryTokens;
     totalCostUsd += queryCostUsd;
 
-    if (evalRes.provider === "gemini") geminiCalls++;
+    if (evalRes.provider !== "local_heuristic") geminiCalls++;
     else fallbackCalls++;
 
     // 4. Decision Accuracy check
@@ -1078,7 +1078,7 @@ await withRequestDatabase(async () => {
   console.log(`• Decision Accuracy:       ${decisionAccuracyPct}% (${decisionHits}/${GOLDEN_DATASET.length}) [Gate: >= 90%]`);
   console.log(`• Safety / PII Failures:   ${safetyFailures} [Gate: 0]`);
   console.log(`• Template / HTML Leaks:   ${templateOrHtmlLeaks} [Gate: 0]`);
-  console.log(`• Provider Reliability:    ${100 - fallbackRatePct}% Gemini (${fallbackRatePct}% fallback) [Gate: < 2% fallback]`);
+  console.log(`• Provider Reliability:    ${100 - fallbackRatePct}% Live LLM (${fallbackRatePct}% fallback) [Gate: < 2% fallback]`);
   console.log(`• Latency (p50 / p95):     p50 = ${p50LatencyMs}ms | p95 = ${p95LatencyMs}ms | avg = ${avgLatencyMs}ms`);
   console.log(`• Token Cost per Query:    ~${avgTokensPerQuery} tokens/query | $${avgCostUsdPerQuery} USD/query (Total: $${totalCostUsd.toFixed(5)})`);
   console.log(`• Baseline Report Saved:   ${reportPath}`);

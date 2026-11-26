@@ -513,7 +513,9 @@ test("Layer 3: API, Concurrency, Security & Failure-Injection Integration Suite"
     await t.test("5. Failure injection: simulated Gemini 429 & 500 bursts during ai_run_ticket recover cleanly with zero live outbound sends", async () => {
       const targetTicketId = ticketIds[1];
       const origFetch = globalThis.fetch;
+      const prevProvider = process.env.AI_PROVIDER;
       const prevRetryBase = process.env.AI_PROVIDER_RETRY_BASE_MS;
+      process.env.AI_PROVIDER = "gemini";
       process.env.AI_PROVIDER_RETRY_BASE_MS = "10";
 
       let chatAttempts = 0;
@@ -614,6 +616,8 @@ test("Layer 3: API, Concurrency, Security & Failure-Injection Integration Suite"
         });
       } finally {
         globalThis.fetch = origFetch;
+        if (prevProvider === undefined) delete process.env.AI_PROVIDER;
+        else process.env.AI_PROVIDER = prevProvider;
         if (prevRetryBase === undefined) delete process.env.AI_PROVIDER_RETRY_BASE_MS;
         else process.env.AI_PROVIDER_RETRY_BASE_MS = prevRetryBase;
       }

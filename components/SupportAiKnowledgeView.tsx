@@ -25,6 +25,7 @@ import { Button } from "./ui/button";
 import { readJson, requestErrorMessage } from "../lib/http";
 import {
   cleanTicketPreviewText,
+  formatChatModelLabel,
   formatCostInr,
   formatCostUsd,
   formatTokensCompact,
@@ -835,7 +836,7 @@ export default function SupportAiKnowledgeView({
                   No tickets have been processed by the AI yet
                 </h3>
                 <p className="text-xs text-muted-foreground max-w-md mx-auto">
-                  Click <strong>Auto-Answer Next 8 Tickets</strong> above to run Gemini 2.5 Flash across your open inbox queries in Safe Draft Mode.
+                  Click <strong>Auto-Answer Next 8 Tickets</strong> above to run {formatChatModelLabel(loadedSettings?.providerInfo?.chatModel)} across your open inbox queries in Safe Draft Mode.
                 </p>
               </div>
               <Button
@@ -1463,7 +1464,7 @@ export default function SupportAiKnowledgeView({
               Interactive Store RAG &amp; AI Decision Simulator
             </h3>
             <p className="text-xs text-muted-foreground">
-              Test how Gemini 2.5 Flash + Hybrid RRF RAG answers or escalates any hypothetical customer question.
+              Test how {formatChatModelLabel(loadedSettings?.providerInfo?.chatModel)} + Hybrid RRF RAG answers or escalates any hypothetical customer question.
             </p>
           </div>
 

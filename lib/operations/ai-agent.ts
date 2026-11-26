@@ -6,9 +6,11 @@ import { supportEvent } from "./support";
 import { extractOrderOrPhoneHints } from "./sla";
 import { visibleEmailBody } from "../email-body";
 import {
+  checkPaidAiBudgetGuard,
   estimateTokenCount,
   generateStructuredJson,
   getConfiguredAiProviderInfo,
+  logAiProviderWarning,
   type AiTokenUsage,
 } from "./ai-provider";
 import {
@@ -164,6 +166,12 @@ export async function recordAiTokenUsage(params: {
         JSON.stringify({
           ...(params.details || {}),
           isEstimated: Boolean(params.usage.isEstimated),
+          ...(typeof params.usage.cacheReadTokens === "number"
+            ? { cacheReadTokens: params.usage.cacheReadTokens }
+            : {}),
+          ...(typeof params.usage.cacheWriteTokens === "number"
+            ? { cacheWriteTokens: params.usage.cacheWriteTokens }
+            : {}),
         }),
       )
       .run();
@@ -696,6 +704,8 @@ export async function buildCompactedThreadContext(params: {
             .filter(Boolean)
             .join("\n"),
           temperature: 0.1,
+          ticketId: params.ticketId,
+          maxTokens: 450,
           fallback: () => {
             const customerLines = olderMessages
               .filter((m) => m.direction === "inbound")
@@ -1371,6 +1381,7 @@ function buildDeterministicFallbackDecision(params: {
  * and returns the structured triage decision (auto_reply, ask_admin_context, or human_action_required).
  */
 export async function evaluateQueryWithStoreRag(params: {
+  ticketId?: string;
   channel: string;
   customerName: string;
   customerEmail: string;
@@ -1508,6 +1519,8 @@ Return JSON with fields:
     systemInstruction,
     userPrompt,
     temperature: 0.1,
+    ticketId: isSimulation ? undefined : params.ticketId,
+    maxTokens: 1100,
     fallback: fallbackDecision,
   });
 
@@ -1772,6 +1785,7 @@ export async function runAiAgentOnTicket(params: {
     );
 
     const { decision, provider, model, usage: triageUsage } = await evaluateQueryWithStoreRag({
+      ticketId: params.ticketId,
       channel: String(ticket.channel || "email"),
       customerName: safeCustomerName,
       customerEmail: String(ticket.reply_to_email || ticket.customer_email || ""),
@@ -2565,6 +2579,16 @@ export async function autoDraftPendingInboundTickets(
   let escalated = 0;
   const paceMs = Math.max(0, Number(process.env.AI_BATCH_PACE_MS ?? 650));
   for (let idx = 0; idx < candidateIds.length; idx++) {
+    const budgetStatus = await checkPaidAiBudgetGuard();
+    if (!budgetStatus.allowed) {
+      logAiProviderWarning("auto_draft_batch_paused", {
+        reason: budgetStatus.reason,
+        processedSoFar: processed,
+        remainingDeferred: candidateIds.length - idx,
+      });
+      deferred += candidateIds.length - idx;
+      break;
+    }
     const ticketId = candidateIds[idx];
     if (idx > 0 && paceMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, paceMs));
