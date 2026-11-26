@@ -24,7 +24,7 @@ export async function operationsDb() {
     if (
       exists?.name &&
       (await db
-        .prepare("SELECT version FROM operations_schema_versions WHERE version='0025_approval_queue_phone_tracking'")
+        .prepare("SELECT version FROM operations_schema_versions WHERE version='0026_token_usage_and_sorting'")
         .first())
     )
       return;
@@ -94,6 +94,12 @@ export async function operationsDb() {
       if (!approvalQueueVersion) {
         await sql.unsafe(SUPPORT_APPROVAL_QUEUE_MIGRATION);
         await sql`INSERT INTO operations_schema_versions(version) VALUES('0025_approval_queue_phone_tracking')`;
+      }
+      const [tokenUsageVersion] =
+        await sql`SELECT version FROM operations_schema_versions WHERE version='0026_token_usage_and_sorting'`;
+      if (!tokenUsageVersion) {
+        await sql.unsafe(SUPPORT_TOKEN_USAGE_MIGRATION);
+        await sql`INSERT INTO operations_schema_versions(version) VALUES('0026_token_usage_and_sorting')`;
       }
     });
     await ensureOptionalExtensionsAndIndexes(db);
@@ -396,6 +402,37 @@ ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS associated_phone TEXT NOT N
 ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS ai_approval_status TEXT NOT NULL DEFAULT '';
 ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS ai_decline_reason TEXT NOT NULL DEFAULT '';
 ALTER TABLE support_ai_escalations ADD COLUMN IF NOT EXISTS decline_reason TEXT NOT NULL DEFAULT '';
+`;
+
+const SUPPORT_TOKEN_USAGE_MIGRATION = `
+CREATE TABLE IF NOT EXISTS support_ai_token_usage (
+  id TEXT PRIMARY KEY,
+  ticket_id TEXT REFERENCES support_tickets(id) ON DELETE SET NULL,
+  message_id TEXT NOT NULL DEFAULT '',
+  operation_type TEXT NOT NULL DEFAULT 'triage',
+  provider TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  estimated_cost_usd NUMERIC(12, 8) NOT NULL DEFAULT 0,
+  actor_id TEXT NOT NULL DEFAULT '',
+  details JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_token_usage_ticket ON support_ai_token_usage (ticket_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_token_usage_message ON support_ai_token_usage (message_id) WHERE message_id <> '';
+CREATE INDEX IF NOT EXISTS idx_ai_token_usage_created ON support_ai_token_usage (created_at DESC);
+
+ALTER TABLE support_ai_token_usage ENABLE ROW LEVEL SECURITY;
+DO $$ DECLARE r TEXT; BEGIN
+  FOREACH r IN ARRAY ARRAY['anon','authenticated'] LOOP
+    IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname = r) THEN
+      EXECUTE format('REVOKE ALL ON TABLE public.support_ai_token_usage FROM %I', r);
+    END IF;
+  END LOOP;
+END $$;
 `;
 
 let pgVectorAvailableCache: boolean | null = null;

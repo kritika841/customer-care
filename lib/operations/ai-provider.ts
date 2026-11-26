@@ -1,5 +1,44 @@
 import { createHash } from "node:crypto";
 
+export type AiTokenUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  estimatedCostUsd: number;
+  isEstimated: boolean;
+};
+
+export function estimateAiCostUsd(
+  model: string,
+  inputTokens: number,
+  outputTokens: number,
+): number {
+  const m = String(model || "").toLowerCase();
+  if (!m || m.includes("local") || m.includes("hashed") || m === "empty") {
+    return 0;
+  }
+  let inputPer1M = 0.15;
+  let outputPer1M = 0.6;
+  if (m.includes("embedding")) {
+    inputPer1M = m.includes("text-embedding-3-small") ? 0.02 : 0.15;
+    outputPer1M = 0;
+  } else if (m.includes("2.5-pro") || m.includes("1.5-pro")) {
+    inputPer1M = 1.25;
+    outputPer1M = 10.0;
+  } else if (m.includes("2.5-flash-lite") || m.includes("flash-lite")) {
+    inputPer1M = 0.1;
+    outputPer1M = 0.4;
+  } else if (m.includes("gpt-4o-mini")) {
+    inputPer1M = 0.15;
+    outputPer1M = 0.6;
+  } else if (m.includes("gpt-4o")) {
+    inputPer1M = 2.5;
+    outputPer1M = 10.0;
+  }
+  const usd = (inputTokens * inputPer1M + outputTokens * outputPer1M) / 1_000_000;
+  return Number(usd.toFixed(8));
+}
+
 export const EMBEDDING_DIM = 768;
 export const DEFAULT_GEMINI_CHAT_MODEL =
   process.env.GEMINI_MODEL || "gemini-2.5-flash";
@@ -146,15 +185,17 @@ export function cosineSimilarity(a: number[] | null | undefined, b: number[] | n
 export async function embedText(
   text: string,
   taskType: "RETRIEVAL_DOCUMENT" | "RETRIEVAL_QUERY" = "RETRIEVAL_DOCUMENT"
-): Promise<{ embedding: number[]; model: string }> {
+): Promise<{ embedding: number[]; model: string; usage: AiTokenUsage }> {
   const clean = String(text || "").trim().slice(0, 8000);
   if (!clean) {
     return {
       embedding: new Array<number>(EMBEDDING_DIM).fill(0),
       model: "empty",
+      usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, estimatedCostUsd: 0, isEstimated: true },
     };
   }
 
+  const approxTokens = estimateTokenCount(clean);
   const geminiKey = getGeminiApiKey();
   if (geminiKey) {
     for (const modelName of DEFAULT_GEMINI_EMBED_MODELS) {
@@ -189,6 +230,13 @@ export async function embedText(
             return {
               embedding: normalizeVector(resized),
               model: modelName,
+              usage: {
+                inputTokens: approxTokens,
+                outputTokens: 0,
+                totalTokens: approxTokens,
+                estimatedCostUsd: estimateAiCostUsd(modelName, approxTokens, 0),
+                isEstimated: true,
+              },
             };
           }
         }
@@ -217,12 +265,22 @@ export async function embedText(
       if (res.ok) {
         const data = (await res.json()) as {
           data?: Array<{ embedding?: number[] }>;
+          usage?: { prompt_tokens?: number; total_tokens?: number };
         };
         const values = data?.data?.[0]?.embedding;
         if (Array.isArray(values) && values.length === EMBEDDING_DIM) {
+          const inTok = Number(data?.usage?.prompt_tokens ?? approxTokens);
+          const totTok = Number(data?.usage?.total_tokens ?? inTok);
           return {
             embedding: normalizeVector(values),
             model: "text-embedding-3-small",
+            usage: {
+              inputTokens: inTok,
+              outputTokens: 0,
+              totalTokens: totTok,
+              estimatedCostUsd: estimateAiCostUsd("text-embedding-3-small", inTok, 0),
+              isEstimated: !data?.usage?.prompt_tokens,
+            },
           };
         }
       }
@@ -234,6 +292,13 @@ export async function embedText(
   return {
     embedding: deterministicLocalEmbedding(clean, EMBEDDING_DIM),
     model: "satmi-hashed-ngram-768",
+    usage: {
+      inputTokens: approxTokens,
+      outputTokens: 0,
+      totalTokens: approxTokens,
+      estimatedCostUsd: 0,
+      isEstimated: true,
+    },
   };
 }
 
@@ -277,9 +342,13 @@ export async function generateStructuredJson<T>(params: {
   data: T;
   provider: "gemini" | "openai" | "local_heuristic";
   model: string;
+  usage: AiTokenUsage;
 }> {
   const temperature = params.temperature ?? 0.15;
   const geminiKey = getGeminiApiKey();
+  const estimatedInputTokens = estimateTokenCount(
+    `${params.systemInstruction}\n${params.userPrompt}`,
+  );
 
   if (geminiKey) {
     const model = DEFAULT_GEMINI_CHAT_MODEL;
@@ -323,6 +392,11 @@ export async function generateStructuredJson<T>(params: {
             candidates?: Array<{
               content?: { parts?: Array<{ text?: string }> };
             }>;
+            usageMetadata?: {
+              promptTokenCount?: number;
+              candidatesTokenCount?: number;
+              totalTokenCount?: number;
+            };
           };
           const rawText =
             payload?.candidates?.[0]?.content?.parts
@@ -330,10 +404,25 @@ export async function generateStructuredJson<T>(params: {
               .join("\n") || "";
           const parsed = parseJsonFromLlmOutput<T>(rawText);
           if (parsed !== null) {
+            const um = payload?.usageMetadata;
+            const inputTokens = Number(um?.promptTokenCount ?? estimatedInputTokens);
+            const outputTokens = Number(
+              um?.candidatesTokenCount ?? estimateTokenCount(rawText),
+            );
+            const totalTokens = Number(
+              um?.totalTokenCount ?? inputTokens + outputTokens,
+            );
             return {
               data: parsed,
               provider: "gemini",
               model,
+              usage: {
+                inputTokens,
+                outputTokens,
+                totalTokens,
+                estimatedCostUsd: estimateAiCostUsd(model, inputTokens, outputTokens),
+                isEstimated: !um?.promptTokenCount,
+              },
             };
           }
         }
@@ -367,14 +456,35 @@ export async function generateStructuredJson<T>(params: {
       if (res.ok) {
         const payload = (await res.json()) as {
           choices?: Array<{ message?: { content?: string } }>;
+          usage?: {
+            prompt_tokens?: number;
+            completion_tokens?: number;
+            total_tokens?: number;
+          };
         };
         const rawText = payload?.choices?.[0]?.message?.content || "";
         const parsed = parseJsonFromLlmOutput<T>(rawText);
         if (parsed !== null) {
+          const inputTokens = Number(
+            payload?.usage?.prompt_tokens ?? estimatedInputTokens,
+          );
+          const outputTokens = Number(
+            payload?.usage?.completion_tokens ?? estimateTokenCount(rawText),
+          );
+          const totalTokens = Number(
+            payload?.usage?.total_tokens ?? inputTokens + outputTokens,
+          );
           return {
             data: parsed,
             provider: "openai",
             model,
+            usage: {
+              inputTokens,
+              outputTokens,
+              totalTokens,
+              estimatedCostUsd: estimateAiCostUsd(model, inputTokens, outputTokens),
+              isEstimated: !payload?.usage?.prompt_tokens,
+            },
           };
         }
       }
@@ -383,9 +493,17 @@ export async function generateStructuredJson<T>(params: {
     }
   }
 
+  const fallbackData = await params.fallback();
   return {
-    data: await params.fallback(),
+    data: fallbackData,
     provider: "local_heuristic",
     model: "satmi-local-grounded-v1",
+    usage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      estimatedCostUsd: 0,
+      isEstimated: true,
+    },
   };
 }

@@ -19,10 +19,16 @@ import {
   Clock,
   Send,
   MessageSquare,
+  Coins,
 } from "lucide-react";
 import { Button } from "./ui/button";
 import { readJson, requestErrorMessage } from "../lib/http";
-import { cleanTicketPreviewText } from "../lib/support-ui";
+import {
+  cleanTicketPreviewText,
+  formatCostInr,
+  formatCostUsd,
+  formatTokensCompact,
+} from "../lib/support-ui";
 
 type KnowledgeDoc = {
   id: string;
@@ -189,8 +195,69 @@ export default function SupportAiKnowledgeView({
   };
 }) {
   const [subTab, setSubTab] = useState<
-    "timeline" | "needs_input" | "knowledge" | "simulator"
+    "timeline" | "needs_input" | "knowledge" | "simulator" | "tokens"
   >("timeline");
+  const [tokenDays, setTokenDays] = useState<number>(30);
+  const [tokenReport, setTokenReport] = useState<{
+    totals: {
+      days: number;
+      requestCount: number;
+      chatsCount: number;
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+      totalCostUsd: number;
+    };
+    byOperation: Array<{
+      operationType: string;
+      requestCount: number;
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+      totalCostUsd: number;
+    }>;
+    byModel: Array<{
+      provider: string;
+      model: string;
+      requestCount: number;
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+      totalCostUsd: number;
+    }>;
+    byChat: Array<{
+      ticketId: string;
+      ticketNumber: number;
+      subject: string;
+      customerName: string;
+      channel: string;
+      requestCount: number;
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+      totalCostUsd: number;
+      lastUsedAt: string;
+    }>;
+    recentRequests: Array<{
+      id: string;
+      ticketId: string | null;
+      messageId: string | null;
+      ticketNumber: number | null;
+      subject: string;
+      customerName: string;
+      channel: string;
+      operationType: string;
+      provider: string;
+      model: string;
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+      estimatedCostUsd: number;
+      actorId: string;
+      createdAt: string;
+    }>;
+  } | null>(null);
+  const [tokenLoading, setTokenLoading] = useState<boolean>(false);
   const [docs, setDocs] = useState<KnowledgeDoc[]>([]);
   const [pendingEscalations, setPendingEscalations] = useState<PendingEscalation[]>([]);
   const [aiTimeline, setAiTimeline] = useState<AiTimelineItem[]>([]);
@@ -282,10 +349,33 @@ export default function SupportAiKnowledgeView({
     }
   }, [categoryFilter, searchQuery]);
 
+  const loadTokenReport = useCallback(async (daysWindow = tokenDays) => {
+    setTokenLoading(true);
+    try {
+      const res = await readJson<NonNullable<typeof tokenReport>>(
+        await fetch(`/api/support?mode=token_usage&days=${daysWindow}`, {
+          cache: "no-store",
+        }),
+      );
+      setTokenReport(res);
+    } catch (e) {
+      setError(requestErrorMessage(e, "Failed to load AI token spend report"));
+    } finally {
+      setTokenLoading(false);
+    }
+  }, [tokenDays]);
+
   useEffect(() => {
     const timer = setTimeout(() => void loadKnowledge(), 0);
     return () => clearTimeout(timer);
   }, [loadKnowledge]);
+
+  useEffect(() => {
+    if (subTab === "tokens") {
+      const timer = setTimeout(() => void loadTokenReport(tokenDays), 0);
+      return () => clearTimeout(timer);
+    }
+  }, [subTab, tokenDays, loadTokenReport]);
 
   async function postAiAction(payload: Record<string, unknown>) {
     setBusy(true);
@@ -549,6 +639,19 @@ export default function SupportAiKnowledgeView({
             >
               <BrainCircuit size={13} />
               <span>Test Simulator</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setSubTab("tokens")}
+              className={`inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold transition cursor-pointer ${
+                subTab === "tokens"
+                  ? "bg-amber-600 text-white shadow-xs"
+                  : "bg-muted/50 text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <Coins size={13} />
+              <span>Token Spend</span>
             </button>
         </div>
 
@@ -1466,6 +1569,318 @@ export default function SupportAiKnowledgeView({
                 </div>
               )}
             </div>
+          )}
+        </div>
+      )}
+
+      {/* SUB-TAB 5: AI TOKEN USAGE & SPEND (GLOBAL, PER-CHAT, PER-REQUEST, PER-MESSAGE) */}
+      {subTab === "tokens" && (
+        <div className="space-y-4">
+          <div className="panel p-4 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-bold text-foreground flex items-center gap-1.5">
+                <Coins size={15} className="text-amber-500" />
+                AI Token Usage &amp; Spend Tracker
+              </h2>
+              <p className="text-[11px] text-muted-foreground mt-0.5">
+                Exact prompt + completion tokens and USD / INR spend across every chat, request, and AI message.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <select
+                aria-label="Token spend date window"
+                value={tokenDays}
+                onChange={(e) => setTokenDays(Number(e.target.value))}
+                className="h-8 rounded-lg border border-input bg-background px-2.5 text-xs font-medium text-foreground"
+              >
+                <option value={7}>Last 7 days</option>
+                <option value={30}>Last 30 days</option>
+                <option value={90}>Last 90 days</option>
+              </select>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                disabled={tokenLoading}
+                onClick={() => void loadTokenReport(tokenDays)}
+              >
+                <RefreshCw size={12} className={tokenLoading ? "spin" : ""} /> Refresh
+              </Button>
+            </div>
+          </div>
+
+          {tokenLoading && !tokenReport ? (
+            <div className="panel p-8 text-center text-xs text-muted-foreground">
+              Loading AI token usage ledger...
+            </div>
+          ) : (
+            tokenReport && (
+              <>
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+                  <div className="panel p-3.5">
+                    <span className="text-[11px] text-muted-foreground">Total Spend</span>
+                    <p className="mt-1 text-xl font-bold text-foreground">
+                      {formatCostUsd(tokenReport.totals.totalCostUsd)}
+                    </p>
+                    <span className="text-[11px] font-mono text-amber-600 dark:text-amber-400">
+                      {formatCostInr(tokenReport.totals.totalCostUsd)} approx
+                    </span>
+                  </div>
+                  <div className="panel p-3.5">
+                    <span className="text-[11px] text-muted-foreground">Total Tokens</span>
+                    <p className="mt-1 text-xl font-bold font-mono text-foreground">
+                      {formatTokensCompact(tokenReport.totals.totalTokens)}
+                    </p>
+                    <span className="text-[10px] text-muted-foreground font-mono">
+                      In {formatTokensCompact(tokenReport.totals.inputTokens)} · Out{" "}
+                      {formatTokensCompact(tokenReport.totals.outputTokens)}
+                    </span>
+                  </div>
+                  <div className="panel p-3.5">
+                    <span className="text-[11px] text-muted-foreground">AI Requests</span>
+                    <p className="mt-1 text-xl font-bold text-foreground">
+                      {tokenReport.totals.requestCount.toLocaleString()}
+                    </p>
+                    <span className="text-[10px] text-muted-foreground">LLM + Embedding calls</span>
+                  </div>
+                  <div className="panel p-3.5">
+                    <span className="text-[11px] text-muted-foreground">Chats Touched</span>
+                    <p className="mt-1 text-xl font-bold text-foreground">
+                      {tokenReport.totals.chatsCount.toLocaleString()}
+                    </p>
+                    <span className="text-[10px] text-muted-foreground">Distinct conversations</span>
+                  </div>
+                  <div className="panel p-3.5 col-span-2 sm:col-span-1">
+                    <span className="text-[11px] text-muted-foreground">Avg Spend / Chat</span>
+                    <p className="mt-1 text-xl font-bold font-mono text-foreground">
+                      {formatCostUsd(
+                        tokenReport.totals.chatsCount > 0
+                          ? tokenReport.totals.totalCostUsd / tokenReport.totals.chatsCount
+                          : 0,
+                      )}
+                    </p>
+                    <span className="text-[10px] text-muted-foreground font-mono">
+                      {formatCostInr(
+                        tokenReport.totals.chatsCount > 0
+                          ? tokenReport.totals.totalCostUsd / tokenReport.totals.chatsCount
+                          : 0,
+                      )}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Operation & Model Breakdown */}
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  <div className="panel overflow-hidden">
+                    <div className="px-4 py-2.5 border-b border-border text-xs font-semibold text-foreground">
+                      Spend by Request Type
+                    </div>
+                    <table className="w-full text-left text-xs border-collapse">
+                      <thead className="bg-muted/50 text-[10px] uppercase text-muted-foreground border-b border-border">
+                        <tr>
+                          <th className="px-3 py-2">Operation</th>
+                          <th className="px-3 py-2 text-right">Calls</th>
+                          <th className="px-3 py-2 text-right">Tokens</th>
+                          <th className="px-3 py-2 text-right">Cost</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-border">
+                        {tokenReport.byOperation.length === 0 ? (
+                          <tr>
+                            <td colSpan={4} className="px-3 py-6 text-center text-muted-foreground">
+                              No AI usage recorded in the last {tokenReport.totals.days} days yet.
+                            </td>
+                          </tr>
+                        ) : (
+                          tokenReport.byOperation.map((row) => (
+                            <tr key={row.operationType}>
+                              <td className="px-3 py-2 font-medium capitalize">
+                                {row.operationType.replaceAll("_", " ")}
+                              </td>
+                              <td className="px-3 py-2 text-right font-mono">{row.requestCount}</td>
+                              <td className="px-3 py-2 text-right font-mono">
+                                {row.totalTokens.toLocaleString()}
+                              </td>
+                              <td className="px-3 py-2 text-right font-mono text-amber-700 dark:text-amber-300">
+                                {formatCostUsd(row.totalCostUsd)} ({formatCostInr(row.totalCostUsd)})
+                              </td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <div className="panel overflow-hidden">
+                    <div className="px-4 py-2.5 border-b border-border text-xs font-semibold text-foreground">
+                      Spend by Model
+                    </div>
+                    <table className="w-full text-left text-xs border-collapse">
+                      <thead className="bg-muted/50 text-[10px] uppercase text-muted-foreground border-b border-border">
+                        <tr>
+                          <th className="px-3 py-2">Model</th>
+                          <th className="px-3 py-2 text-right">Calls</th>
+                          <th className="px-3 py-2 text-right">Tokens</th>
+                          <th className="px-3 py-2 text-right">Cost</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-border">
+                        {tokenReport.byModel.length === 0 ? (
+                          <tr>
+                            <td colSpan={4} className="px-3 py-6 text-center text-muted-foreground">
+                              No model usage recorded yet.
+                            </td>
+                          </tr>
+                        ) : (
+                          tokenReport.byModel.map((row) => (
+                            <tr key={`${row.provider}-${row.model}`}>
+                              <td className="px-3 py-2 font-mono text-[11px]">{row.model}</td>
+                              <td className="px-3 py-2 text-right font-mono">{row.requestCount}</td>
+                              <td className="px-3 py-2 text-right font-mono">
+                                {row.totalTokens.toLocaleString()}
+                              </td>
+                              <td className="px-3 py-2 text-right font-mono text-amber-700 dark:text-amber-300">
+                                {formatCostUsd(row.totalCostUsd)} ({formatCostInr(row.totalCostUsd)})
+                              </td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {/* Per-Chat Spend Table */}
+                <div className="panel overflow-hidden">
+                  <div className="px-4 py-2.5 border-b border-border text-xs font-semibold text-foreground">
+                    Per-Chat Token Spend (Top 50 Conversations)
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs border-collapse min-w-[680px]">
+                      <thead className="bg-muted/50 text-[10px] uppercase text-muted-foreground border-b border-border">
+                        <tr>
+                          <th className="px-3 py-2">Conversation</th>
+                          <th className="px-3 py-2">Customer</th>
+                          <th className="px-3 py-2 text-right">Requests</th>
+                          <th className="px-3 py-2 text-right">In / Out Tokens</th>
+                          <th className="px-3 py-2 text-right">Total Spend</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-border">
+                        {tokenReport.byChat.length === 0 ? (
+                          <tr>
+                            <td colSpan={5} className="px-3 py-6 text-center text-muted-foreground">
+                              No per-chat token records yet.
+                            </td>
+                          </tr>
+                        ) : (
+                          tokenReport.byChat.map((c) => (
+                            <tr
+                              key={c.ticketId}
+                              onClick={() => onOpenTicket(c.ticketId)}
+                              className="hover:bg-muted/25 cursor-pointer"
+                            >
+                              <td className="px-3 py-2">
+                                <span className="font-mono font-semibold text-primary">
+                                  #{c.ticketNumber}
+                                </span>{" "}
+                                <span className="text-foreground">{c.subject || "(No subject)"}</span>
+                              </td>
+                              <td className="px-3 py-2 text-muted-foreground">
+                                {c.customerName || "Customer"} · {c.channel}
+                              </td>
+                              <td className="px-3 py-2 text-right font-mono">{c.requestCount}</td>
+                              <td className="px-3 py-2 text-right font-mono text-muted-foreground">
+                                {c.inputTokens.toLocaleString()} / {c.outputTokens.toLocaleString()}
+                              </td>
+                              <td className="px-3 py-2 text-right font-mono font-semibold text-amber-700 dark:text-amber-300">
+                                {formatCostUsd(c.totalCostUsd)} ({formatCostInr(c.totalCostUsd)})
+                              </td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {/* Per-Request / Per-Message Audit Log */}
+                <div className="panel overflow-hidden">
+                  <div className="px-4 py-2.5 border-b border-border text-xs font-semibold text-foreground">
+                    Recent Per-Request &amp; Per-Message AI Log (Latest 100)
+                  </div>
+                  <div className="overflow-x-auto max-h-96 overflow-y-auto">
+                    <table className="w-full text-left text-xs border-collapse min-w-[760px]">
+                      <thead className="bg-muted/50 text-[10px] uppercase text-muted-foreground border-b border-border sticky top-0">
+                        <tr>
+                          <th className="px-3 py-2">Time</th>
+                          <th className="px-3 py-2">Operation</th>
+                          <th className="px-3 py-2">Conversation / Message</th>
+                          <th className="px-3 py-2">Model</th>
+                          <th className="px-3 py-2 text-right">Tokens (In/Out)</th>
+                          <th className="px-3 py-2 text-right">Cost</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-border">
+                        {tokenReport.recentRequests.length === 0 ? (
+                          <tr>
+                            <td colSpan={6} className="px-3 py-6 text-center text-muted-foreground">
+                              No AI requests recorded yet.
+                            </td>
+                          </tr>
+                        ) : (
+                          tokenReport.recentRequests.map((req) => (
+                            <tr
+                              key={req.id}
+                              onClick={() => {
+                                if (req.ticketId) onOpenTicket(req.ticketId);
+                              }}
+                              className={req.ticketId ? "hover:bg-muted/25 cursor-pointer" : ""}
+                            >
+                              <td className="px-3 py-2 text-[11px] text-muted-foreground whitespace-nowrap">
+                                {formatExactTimestamp(req.createdAt)}
+                              </td>
+                              <td className="px-3 py-2 font-medium capitalize">
+                                {req.operationType.replaceAll("_", " ")}
+                              </td>
+                              <td className="px-3 py-2">
+                                {req.ticketNumber ? (
+                                  <span className="text-foreground">
+                                    <strong className="font-mono text-primary">
+                                      #{req.ticketNumber}
+                                    </strong>{" "}
+                                    {req.customerName || req.subject}
+                                    {req.messageId ? (
+                                      <span className="ml-1.5 rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                                        msg:{req.messageId.slice(0, 8)}
+                                      </span>
+                                    ) : null}
+                                  </span>
+                                ) : (
+                                  <span className="text-muted-foreground">Global / Memory / Sandbox</span>
+                                )}
+                              </td>
+                              <td className="px-3 py-2 font-mono text-[11px] text-muted-foreground">
+                                {req.model}
+                              </td>
+                              <td className="px-3 py-2 text-right font-mono">
+                                {req.totalTokens.toLocaleString()}{" "}
+                                <span className="text-[10px] text-muted-foreground">
+                                  ({req.inputTokens}/{req.outputTokens})
+                                </span>
+                              </td>
+                              <td className="px-3 py-2 text-right font-mono text-amber-700 dark:text-amber-300 whitespace-nowrap">
+                                {formatCostUsd(req.estimatedCostUsd)} ({formatCostInr(req.estimatedCostUsd)})
+                              </td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </>
+            )
           )}
         </div>
       )}

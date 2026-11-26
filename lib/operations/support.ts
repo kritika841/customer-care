@@ -61,6 +61,25 @@ export type SupportSnapshot = {
   aiSettings?: AiSettings;
   aiEscalations?: SupportRow[];
   aiThreadTokenEstimate?: number;
+  aiChatTokenTotals?: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    estimatedCostUsd: number;
+    requestCount: number;
+  };
+  aiChatTokenLogs?: Array<{
+    id: string;
+    messageId: string | null;
+    operationType: string;
+    provider: string;
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    estimatedCostUsd: number;
+    createdAt: string;
+  }>;
   aiKnowledgeSummary?: {
     totalDocuments: number;
     totalChunks: number;
@@ -365,7 +384,16 @@ export async function supportData(
   const channelFilter = allowedChannels.has(filters.channel || "")
     ? String(filters.channel)
     : "all";
-  const allowedSorts = new Set(["newest", "fifo", "sla"]);
+  const allowedSorts = new Set([
+    "newest",
+    "oldest",
+    "updated",
+    "needs_reply",
+    "fifo",
+    "sla",
+    "ticket_desc",
+    "ticket_asc",
+  ]);
   const sort = allowedSorts.has(filters.sort || "")
     ? String(filters.sort)
     : "newest";
@@ -429,19 +457,32 @@ export async function supportData(
   const summaryWhere = canManage ? "TRUE" : "assignee_id=?";
   const summaryValues = canManage ? [] : [u.id];
 
+  const latestActivityExpr = `COALESCE(latest_msg.msg_at, latest_inbound.customer_at, support_tickets.last_inbound_at, support_tickets.created_at)`;
   const orderByClause =
     sort === "fifo"
       ? `CASE WHEN support_tickets.status = 'resolved' THEN 1 ELSE 0 END ASC,
          CASE WHEN COALESCE(latest_msg.direction, 'inbound') = 'inbound' THEN 0 ELSE 1 END ASC,
-         COALESCE(support_tickets.last_inbound_at, support_tickets.created_at) ASC,
-         support_tickets.updated_at ASC,
+         COALESCE(support_tickets.last_inbound_at, latest_inbound.customer_at, support_tickets.created_at) ASC,
+         support_tickets.ticket_number ASC,
          support_tickets.id`
       : sort === "sla"
         ? `CASE WHEN support_tickets.status = 'resolved' THEN 2 WHEN COALESCE(latest_msg.direction, 'inbound') = 'inbound' OR support_tickets.first_response_at IS NULL THEN 0 ELSE 1 END ASC,
            COALESCE(support_tickets.sla_due_at, support_tickets.created_at + interval '12 hours') ASC,
-           support_tickets.updated_at DESC,
+           ${latestActivityExpr} DESC,
            support_tickets.id`
-        : `support_tickets.updated_at DESC, support_tickets.id`;
+        : sort === "oldest"
+          ? `${latestActivityExpr} ASC, support_tickets.ticket_number ASC, support_tickets.id`
+          : sort === "updated"
+            ? `support_tickets.updated_at DESC, support_tickets.ticket_number DESC, support_tickets.id`
+            : sort === "needs_reply"
+              ? `CASE WHEN support_tickets.status = 'resolved' THEN 2 WHEN COALESCE(latest_msg.direction, 'inbound') = 'inbound' THEN 0 ELSE 1 END ASC,
+                 ${latestActivityExpr} DESC,
+                 support_tickets.id`
+              : sort === "ticket_desc"
+                ? `support_tickets.ticket_number DESC, support_tickets.id`
+                : sort === "ticket_asc"
+                  ? `support_tickets.ticket_number ASC, support_tickets.id`
+                  : `${latestActivityExpr} DESC, support_tickets.ticket_number DESC, support_tickets.id`;
 
   const [
     ticketRows,
@@ -463,12 +504,19 @@ export async function supportData(
            COALESCE(latest_msg.excerpt, '') AS excerpt,
            COALESCE(latest_msg.direction, '') AS last_direction,
            COALESCE(latest_msg.message_count, 0) AS message_count,
+           COALESCE(latest_msg.msg_at, latest_inbound.customer_at, support_tickets.last_inbound_at, support_tickets.created_at) AS last_message_at,
            COALESCE(latest_inbound.customer_body, '') AS customer_last_body,
            latest_inbound.customer_at AS customer_last_at,
            COALESCE(latest_ai.ai_reply_id, '') AS ai_reply_id,
            COALESCE(latest_ai.ai_reply_body, '') AS ai_reply_body,
            latest_ai.ai_reply_at AS ai_reply_at,
            COALESCE(latest_ai.ai_delivery_status, '') AS ai_delivery_status,
+           COALESCE(latest_ai.ai_reply_tokens, 0) AS ai_reply_tokens,
+           COALESCE(latest_ai.ai_reply_cost_usd, 0) AS ai_reply_cost_usd,
+           COALESCE(tok.ai_input_tokens, 0) AS ai_input_tokens,
+           COALESCE(tok.ai_output_tokens, 0) AS ai_output_tokens,
+           COALESCE(tok.ai_total_tokens, 0) AS ai_total_tokens,
+           COALESCE(tok.ai_total_cost_usd, 0) AS ai_total_cost_usd,
            COALESCE(latest_esc.esc_id, '') AS ai_escalation_id,
            COALESCE(latest_esc.esc_type, '') AS ai_escalation_type,
            COALESCE(latest_esc.esc_category, '') AS ai_action_category,
@@ -483,6 +531,7 @@ export async function supportData(
            SELECT
              LEFT(TRIM(REGEXP_REPLACE(sm.body, '<[^>]+>', ' ', 'g')), 650) AS excerpt,
              sm.direction,
+             sm.created_at AS msg_at,
              (SELECT COUNT(*)::int FROM support_messages sm2 WHERE sm2.ticket_id = support_tickets.id AND sm2.delivery_status <> 'ai_draft') AS message_count
            FROM support_messages sm
            WHERE sm.ticket_id = support_tickets.id
@@ -521,13 +570,24 @@ export async function supportData(
              sm_ai.id AS ai_reply_id,
              LEFT(TRIM(sm_ai.body), 900) AS ai_reply_body,
              sm_ai.created_at AS ai_reply_at,
-             sm_ai.delivery_status AS ai_delivery_status
+             sm_ai.delivery_status AS ai_delivery_status,
+             COALESCE((SELECT SUM(u2.total_tokens)::int FROM support_ai_token_usage u2 WHERE u2.message_id = sm_ai.id), 0) AS ai_reply_tokens,
+             COALESCE((SELECT SUM(u2.estimated_cost_usd)::float8 FROM support_ai_token_usage u2 WHERE u2.message_id = sm_ai.id), 0) AS ai_reply_cost_usd
            FROM support_messages sm_ai
            WHERE sm_ai.ticket_id = support_tickets.id
              AND (sm_ai.delivery_status = 'ai_draft' OR sm_ai.created_by = 'ai_agent')
            ORDER BY sm_ai.created_at DESC, sm_ai.id DESC
            LIMIT 1
          ) latest_ai ON TRUE
+         LEFT JOIN LATERAL (
+           SELECT
+             COALESCE(SUM(atu.input_tokens), 0)::int AS ai_input_tokens,
+             COALESCE(SUM(atu.output_tokens), 0)::int AS ai_output_tokens,
+             COALESCE(SUM(atu.total_tokens), 0)::int AS ai_total_tokens,
+             COALESCE(SUM(atu.estimated_cost_usd), 0)::float8 AS ai_total_cost_usd
+           FROM support_ai_token_usage atu
+           WHERE atu.ticket_id = support_tickets.id
+         ) tok ON TRUE
          LEFT JOIN LATERAL (
            SELECT
              esc.id AS esc_id,
@@ -638,6 +698,25 @@ export async function supportData(
   let activeViewers: SupportSnapshot["activeViewers"] = [];
   let aiEscalations: SupportRow[] = [];
   let aiThreadTokenEstimate = 0;
+  let aiChatTokenTotals = {
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    estimatedCostUsd: 0,
+    requestCount: 0,
+  };
+  let aiChatTokenLogs: Array<{
+    id: string;
+    messageId: string | null;
+    operationType: string;
+    provider: string;
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    estimatedCostUsd: number;
+    createdAt: string;
+  }> = [];
 
   if (id) {
     selectedTicket = await db
@@ -653,7 +732,7 @@ export async function supportData(
     const externalUserId = String(selectedTicket.external_user_id || "");
     const ticketEmail = String(selectedTicket.customer_email || "");
 
-    const [messageRows, eventRows, savedLink, escalationRows] = await Promise.all([
+    const [messageRows, eventRows, savedLink, escalationRows, tokenUsageRows] = await Promise.all([
       db
         .prepare(
           `SELECT id, ticket_id, gmail_message_id, message_id, direction, sender, recipients,
@@ -704,12 +783,75 @@ export async function supportData(
         .bind(id)
         .all<Record<string, unknown>>()
         .catch(() => ({ results: [] as Record<string, unknown>[] })),
+      db
+        .prepare(
+          `SELECT id, message_id, operation_type, provider, model,
+                  input_tokens, output_tokens, total_tokens, estimated_cost_usd, created_at
+           FROM support_ai_token_usage
+           WHERE ticket_id=?
+           ORDER BY created_at DESC
+           LIMIT 60`,
+        )
+        .bind(id)
+        .all<Record<string, unknown>>()
+        .catch(() => ({ results: [] as Record<string, unknown>[] })),
     ]);
 
     aiEscalations = escalationRows.results as SupportRow[];
+    aiChatTokenLogs = (tokenUsageRows.results || []).map((r) => ({
+      id: String(r.id || ""),
+      messageId: r.message_id ? String(r.message_id) : null,
+      operationType: String(r.operation_type || ""),
+      provider: String(r.provider || ""),
+      model: String(r.model || ""),
+      inputTokens: Number(r.input_tokens || 0),
+      outputTokens: Number(r.output_tokens || 0),
+      totalTokens: Number(r.total_tokens || 0),
+      estimatedCostUsd: Number(r.estimated_cost_usd || 0),
+      createdAt: String(r.created_at || ""),
+    }));
+    aiChatTokenTotals = {
+      inputTokens: aiChatTokenLogs.reduce((s, r) => s + r.inputTokens, 0),
+      outputTokens: aiChatTokenLogs.reduce((s, r) => s + r.outputTokens, 0),
+      totalTokens: aiChatTokenLogs.reduce((s, r) => s + r.totalTokens, 0),
+      estimatedCostUsd: aiChatTokenLogs.reduce((s, r) => s + r.estimatedCostUsd, 0),
+      requestCount: aiChatTokenLogs.length,
+    };
+
+    const tokenUsageByMessage = new Map<
+      string,
+      {
+        inputTokens: number;
+        outputTokens: number;
+        totalTokens: number;
+        estimatedCostUsd: number;
+        model: string;
+        operationType: string;
+      }
+    >();
+    for (const log of aiChatTokenLogs) {
+      if (!log.messageId) continue;
+      const existing = tokenUsageByMessage.get(log.messageId);
+      if (!existing) {
+        tokenUsageByMessage.set(log.messageId, {
+          inputTokens: log.inputTokens,
+          outputTokens: log.outputTokens,
+          totalTokens: log.totalTokens,
+          estimatedCostUsd: log.estimatedCostUsd,
+          model: log.model,
+          operationType: log.operationType,
+        });
+      } else {
+        existing.inputTokens += log.inputTokens;
+        existing.outputTokens += log.outputTokens;
+        existing.totalTokens += log.totalTokens;
+        existing.estimatedCostUsd += log.estimatedCostUsd;
+      }
+    }
 
     messages = (messageRows.results as SupportRow[]).map((m) => ({
       ...m,
+      token_usage: tokenUsageByMessage.get(String(m.id)) || null,
       attachments: Array.isArray(m.attachments)
         ? m.attachments.map((att: SupportRow) => ({
             name: String(att.name || "attachment"),
@@ -929,6 +1071,8 @@ export async function supportData(
     aiSettings,
     aiEscalations,
     aiThreadTokenEstimate,
+    aiChatTokenTotals,
+    aiChatTokenLogs,
     aiKnowledgeSummary: {
       totalDocuments: Number(kbSummaryRow?.total_docs || 0),
       totalChunks: Number(kbSummaryRow?.total_chunks || 0),
@@ -975,7 +1119,7 @@ export async function supportInsights(days = 14) {
   const safeDays = Math.max(7, Math.min(90, Math.floor(days || 14)));
   const intervalStr = `${safeDays} days`;
 
-  const [overall, dailyRows, agentRows] = await Promise.all([
+  const [overall, dailyRows, agentRows, tokenSummaryRow] = await Promise.all([
     db
       .prepare(
         `SELECT
@@ -1034,6 +1178,21 @@ export async function supportInsights(days = 14) {
       )
       .bind(intervalStr)
       .all<Record<string, unknown>>(),
+    db
+      .prepare(
+        `SELECT
+           COUNT(*)::int AS request_count,
+           COUNT(DISTINCT ticket_id) FILTER (WHERE ticket_id IS NOT NULL)::int AS chats_count,
+           COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
+           COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
+           COALESCE(SUM(total_tokens), 0)::bigint AS total_tokens,
+           COALESCE(SUM(estimated_cost_usd), 0)::float8 AS total_cost_usd
+         FROM support_ai_token_usage
+         WHERE created_at >= now() - ?::interval`,
+      )
+      .bind(intervalStr)
+      .first<Record<string, unknown>>()
+      .catch(() => null),
   ]);
 
   const totalTickets = Number(overall?.total_tickets || 0);
@@ -1050,6 +1209,14 @@ export async function supportInsights(days = 14) {
     slaCompliancePercent: slaMeasured ? Math.round((slaMet / slaMeasured) * 100) : null,
     avgCsatScore: overall?.avg_csat != null ? Number(overall.avg_csat) : null,
     csatCount: Number(overall?.csat_count || 0),
+    tokenSummary: {
+      requestCount: Number(tokenSummaryRow?.request_count || 0),
+      chatsCount: Number(tokenSummaryRow?.chats_count || 0),
+      inputTokens: Number(tokenSummaryRow?.input_tokens || 0),
+      outputTokens: Number(tokenSummaryRow?.output_tokens || 0),
+      totalTokens: Number(tokenSummaryRow?.total_tokens || 0),
+      totalCostUsd: Number(tokenSummaryRow?.total_cost_usd || 0),
+    },
     dailyVolume: dailyRows.results.map((r) => ({
       day: String(r.day),
       email: Number(r.email || 0),
@@ -1359,7 +1526,7 @@ export async function mutateSupport(
       await sql`
         UPDATE support_tickets
         SET status=${nextStatus},
-            resolved_at=${nextStatus === "resolved" ? sql`COALESCE(resolved_at, now())` : null},
+            resolved_at=CASE WHEN ${nextStatus === "resolved"} THEN COALESCE(resolved_at, now()) ELSE NULL END,
             sla_due_at=COALESCE(${nextSlaDue}::timestamptz, sla_due_at),
             assignee_id=COALESCE(assignee_id,${u.id})
         WHERE id=${id}
@@ -1525,7 +1692,7 @@ export async function mutateSupport(
           SET assignee_id = COALESCE(assignee_id, ${u.id}),
               first_response_at = COALESCE(first_response_at, now()),
               status = ${resolveAfterSend ? "resolved" : nextStatus},
-              resolved_at = ${resolveAfterSend ? sql`COALESCE(resolved_at, now())` : t.resolved_at},
+              resolved_at = CASE WHEN ${resolveAfterSend} THEN COALESCE(resolved_at, now()) ELSE resolved_at END,
               priority = ${nextPriority},
               sla_due_at = ${nextSlaDue || null}::timestamptz,
               tags = ${sql.json(mergedTags)},

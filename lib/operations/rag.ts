@@ -6,6 +6,7 @@ import {
   embedText,
   estimateTokenCount,
   getConfiguredAiProviderInfo,
+  type AiTokenUsage,
 } from "./ai-provider";
 
 export type KnowledgeCategory = "policy" | "product" | "faq" | "admin_memory" | "template";
@@ -71,6 +72,7 @@ export type StoreContextBundle = {
   topLexicalScore: number;
   hasStrongKnowledgeMatch: boolean;
   embeddingModel: string;
+  embeddingUsage: AiTokenUsage;
 };
 
 function escapeRegExp(value: string): string {
@@ -1735,10 +1737,11 @@ export async function retrieveStoreContext(params: {
   }
 
   // --- TIER 2: HYBRID VECTOR + LEXICAL FULL-TEXT SEARCH WITH RRF ---
-  const { embedding: queryEmbedding, model: embeddingModel } = await embedText(
-    cleanQuery,
-    "RETRIEVAL_QUERY"
-  );
+  const {
+    embedding: queryEmbedding,
+    model: embeddingModel,
+    usage: embeddingUsage,
+  } = await embedText(cleanQuery, "RETRIEVAL_QUERY");
 
   const hasPgVector = await isPgVectorAvailable();
   const vectorLiteral = `[${queryEmbedding.join(",")}]`;
@@ -1974,6 +1977,7 @@ export async function retrieveStoreContext(params: {
     topLexicalScore,
     hasStrongKnowledgeMatch,
     embeddingModel,
+    embeddingUsage,
   };
 }
 

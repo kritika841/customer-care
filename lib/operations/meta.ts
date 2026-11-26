@@ -1479,7 +1479,7 @@ export async function ingestMetaWebhook(payload: {
                 customer_email = ${customerHandle},
                 external_username = ${customerHandle},
                 last_inbound_at = GREATEST(COALESCE(last_inbound_at, ${createdAt}::timestamptz), ${createdAt}::timestamptz),
-                updated_at = NOW(),
+                updated_at = GREATEST(updated_at, ${createdAt}::timestamptz),
                 version = version + 1
             WHERE id = ${ticketId}
           `;

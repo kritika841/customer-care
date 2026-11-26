@@ -25,6 +25,8 @@ const { rolesOf, hasRole, isAdmin, isSupportManager, isSupportRole } = await imp
 );
 const { validateRemoteAttachmentUrl } = await import("../lib/operations/attachment-url");
 const { verifyMetaSignature } = await import("../lib/operations/meta");
+const { estimateAiCostUsd } = await import("../lib/operations/ai-provider");
+const { formatTokensCompact, formatCostUsd, formatCostInr } = await import("../lib/support-ui");
 const {
   slaMinutesForPriority,
   computeSlaDueAt,
@@ -337,6 +339,13 @@ test("Mandatory human escalation triggers: callbacks, damaged/wrong items, manua
     topLexicalScore: 0,
     hasStrongKnowledgeMatch: false,
     embeddingModel: "test",
+    embeddingUsage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      estimatedCostUsd: 0,
+      isEstimated: false,
+    },
   };
 
   // 1. Callback Request
@@ -595,6 +604,13 @@ test("AI draft safety validator, Hinglish/money-back triggers, PII scrubbing, an
     topLexicalScore: 0.8,
     hasStrongKnowledgeMatch: true,
     embeddingModel: "gemini-embedding-001",
+    embeddingUsage: {
+      inputTokens: 12,
+      outputTokens: 0,
+      totalTokens: 12,
+      estimatedCostUsd: 0.000002,
+      isEstimated: false,
+    },
   };
 
   assert.equal(
@@ -754,6 +770,13 @@ test("Phone mismatch across orders triggers mandatory human intervention & track
       topLexicalScore: 0,
       hasStrongKnowledgeMatch: false,
       embeddingModel: "test",
+      embeddingUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        estimatedCostUsd: 0,
+        isEstimated: false,
+      },
     },
     vipThreshold: 3000,
   });
@@ -763,5 +786,27 @@ test("Phone mismatch across orders triggers mandatory human intervention & track
   assert.match(buildCourierTrackingUrl("Delhivery", "AWB12345"), /delhivery\.com/);
   assert.match(buildCourierTrackingUrl("Shadowfax", "SF998877"), /shadowfax\.in/);
   assert.match(buildCourierTrackingUrl("", "SR112233"), /shiprocket\.co\/tracking\/SR112233/);
+});
+
+test("AI token cost estimator and spend formatting helpers", () => {
+  // Local/hashed fallback models always cost $0
+  assert.equal(estimateAiCostUsd("local_heuristic", 5000, 1000), 0);
+  assert.equal(estimateAiCostUsd("satmi-hashed-ngram-768", 500, 0), 0);
+
+  // Gemini 2.5 Flash: $0.15/1M in, $0.60/1M out
+  const flashCost = estimateAiCostUsd("gemini-2.5-flash", 1_000_000, 1_000_000);
+  assert.equal(flashCost, 0.75);
+
+  // Small single message cost > 0
+  const msgCost = estimateAiCostUsd("gemini-2.5-flash", 1200, 200);
+  assert.ok(msgCost > 0 && msgCost < 0.001);
+
+  assert.equal(formatTokensCompact(420), "420");
+  assert.equal(formatTokensCompact(15400), "15.4k");
+  assert.equal(formatTokensCompact(1_250_000), "1.25M");
+  assert.equal(formatCostUsd(0), "$0.00");
+  assert.equal(formatCostUsd(0.0025), "$0.0025");
+  assert.equal(formatCostInr(0), "₹0.00");
+  assert.equal(formatCostInr(0.01, 85), "₹0.85");
 });
 

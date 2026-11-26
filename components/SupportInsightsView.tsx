@@ -1,7 +1,8 @@
 "use client";
 
-import { ArrowLeft, RefreshCw, Star } from "lucide-react";
+import { ArrowLeft, Coins, RefreshCw, Star } from "lucide-react";
 import { Button } from "./ui/button";
+import { formatCostInr, formatCostUsd, formatTokensCompact } from "../lib/support-ui";
 
 export type InsightsData = {
   days: number;
@@ -12,6 +13,14 @@ export type InsightsData = {
   slaCompliancePercent: number | null;
   avgCsatScore: number | null;
   csatCount: number;
+  tokenSummary?: {
+    requestCount: number;
+    chatsCount: number;
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    totalCostUsd: number;
+  };
   dailyVolume: Array<{
     day: string;
     email: number;
@@ -104,7 +113,7 @@ export default function SupportInsightsView({
       ) : (
         <>
           {/* Core Metrics Strip */}
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-6 gap-3">
             <div className="panel p-4">
               <span className="text-[11px] font-medium text-muted-foreground">
                 Volume ({insights.days}d)
@@ -147,7 +156,7 @@ export default function SupportInsightsView({
               <span className="text-[10px] text-muted-foreground">Replied within target</span>
             </div>
 
-            <div className="panel p-4 col-span-2 sm:col-span-1">
+            <div className="panel p-4">
               <span className="text-[11px] font-medium text-muted-foreground">CSAT Score</span>
               <p className="mt-1 text-2xl font-bold tracking-tight text-amber-500 flex items-center gap-1">
                 {insights.avgCsatScore != null ? (
@@ -161,6 +170,19 @@ export default function SupportInsightsView({
               </p>
               <span className="text-[10px] text-muted-foreground">
                 {insights.csatCount} rating{insights.csatCount === 1 ? "" : "s"}
+              </span>
+            </div>
+
+            <div className="panel p-4">
+              <span className="text-[11px] font-medium text-muted-foreground flex items-center gap-1">
+                <Coins size={12} className="text-amber-500" /> AI Token Spend
+              </span>
+              <p className="mt-1 text-xl font-bold tracking-tight text-foreground">
+                {formatCostUsd(insights.tokenSummary?.totalCostUsd || 0)}
+              </p>
+              <span className="text-[10px] text-muted-foreground font-mono block">
+                {formatCostInr(insights.tokenSummary?.totalCostUsd || 0)} ·{" "}
+                {formatTokensCompact(insights.tokenSummary?.totalTokens || 0)} tok
               </span>
             </div>
           </div>

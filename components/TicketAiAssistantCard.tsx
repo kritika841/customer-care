@@ -12,9 +12,11 @@ import {
   ChevronDown,
   ChevronUp,
   ShieldCheck,
+  Coins,
 } from "lucide-react";
 import { Button } from "./ui/button";
 import { readJson, requestErrorMessage } from "../lib/http";
+import { formatCostInr, formatCostUsd, formatTokensCompact } from "../lib/support-ui";
 
 export type AiEscalationItem = {
   id: string;
@@ -34,6 +36,8 @@ export default function TicketAiAssistantCard({
   ticket,
   escalations,
   threadTokenEstimate,
+  chatTokenTotals,
+  chatTokenLogs = [],
   compactionThreshold = 10000,
   approvalModeEnabled = true,
   latestInboundText,
@@ -55,6 +59,25 @@ export default function TicketAiAssistantCard({
   };
   escalations: AiEscalationItem[];
   threadTokenEstimate: number;
+  chatTokenTotals?: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    estimatedCostUsd: number;
+    requestCount: number;
+  };
+  chatTokenLogs?: Array<{
+    id: string;
+    messageId: string | null;
+    operationType: string;
+    provider: string;
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    estimatedCostUsd: number;
+    createdAt: string;
+  }>;
   compactionThreshold?: number;
   approvalModeEnabled?: boolean;
   latestInboundText: string;
@@ -65,6 +88,7 @@ export default function TicketAiAssistantCard({
 
   const [adminPanelOpen, setAdminPanelOpen] = useState<boolean>(false);
   const [summaryOpen, setSummaryOpen] = useState<boolean>(false);
+  const [tokenLogOpen, setTokenLogOpen] = useState<boolean>(false);
   const [adminRawAnswer, setAdminRawAnswer] = useState<string>("");
   const [saveToMemory, setSaveToMemory] = useState<boolean>(true);
   const [memoryPreview, setMemoryPreview] = useState<{
@@ -292,6 +316,27 @@ export default function TicketAiAssistantCard({
             )}
             {summaryOpen ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
           </button>
+
+          {/* Per-Chat Real Token & Spend Pill */}
+          <button
+            type="button"
+            onClick={() => setTokenLogOpen((v) => !v)}
+            title="Click to inspect per-chat and per-request AI token usage & cost"
+            className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/35 bg-amber-500/10 px-2.5 py-0.5 text-[11px] font-mono text-amber-800 dark:text-amber-300 hover:bg-amber-500/15 transition cursor-pointer"
+          >
+            <Coins size={11} />
+            <span>
+              Chat AI: {formatTokensCompact(chatTokenTotals?.totalTokens || 0)} tok ·{" "}
+              {formatCostUsd(chatTokenTotals?.estimatedCostUsd || 0)} (
+              {formatCostInr(chatTokenTotals?.estimatedCostUsd || 0)})
+            </span>
+            {(chatTokenTotals?.requestCount || 0) > 0 && (
+              <span className="text-[10px] opacity-80">
+                ({chatTokenTotals?.requestCount} req)
+              </span>
+            )}
+            {tokenLogOpen ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+          </button>
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5">
@@ -420,6 +465,77 @@ export default function TicketAiAssistantCard({
               {threadTokenEstimate.toLocaleString()} tokens). Click{" "}
               <strong>Compact Summary</strong> above to generate a checkpoint now.
             </p>
+          )}
+        </div>
+      )}
+
+      {/* Expandable Per-Chat & Per-Request Token Breakdown */}
+      {tokenLogOpen && (
+        <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-3 space-y-2 text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <strong className="text-[11px] font-bold uppercase tracking-wider text-amber-800 dark:text-amber-300">
+              Per-Chat &amp; Per-Request AI Token Breakdown
+            </strong>
+            <span className="font-mono text-[11px] text-foreground">
+              In: {(chatTokenTotals?.inputTokens || 0).toLocaleString()} · Out:{" "}
+              {(chatTokenTotals?.outputTokens || 0).toLocaleString()} · Total:{" "}
+              {(chatTokenTotals?.totalTokens || 0).toLocaleString()} tok ·{" "}
+              <strong>{formatCostUsd(chatTokenTotals?.estimatedCostUsd || 0)}</strong> (
+              {formatCostInr(chatTokenTotals?.estimatedCostUsd || 0)})
+            </span>
+          </div>
+
+          {chatTokenLogs.length === 0 ? (
+            <p className="text-[11px] text-muted-foreground">
+              No AI requests logged for this conversation yet. Run AI Agent or Teach AI to record per-request usage.
+            </p>
+          ) : (
+            <div className="max-h-44 overflow-y-auto rounded-lg border border-border bg-card">
+              <table className="w-full text-left text-[11px] border-collapse">
+                <thead className="bg-muted/50 text-[10px] uppercase text-muted-foreground border-b border-border">
+                  <tr>
+                    <th className="px-2.5 py-1.5">Request</th>
+                    <th className="px-2.5 py-1.5">Model</th>
+                    <th className="px-2.5 py-1.5 text-right">In / Out</th>
+                    <th className="px-2.5 py-1.5 text-right">Total</th>
+                    <th className="px-2.5 py-1.5 text-right">Cost</th>
+                    <th className="px-2.5 py-1.5 text-right">When</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border font-mono">
+                  {chatTokenLogs.map((log) => (
+                    <tr key={log.id} className="hover:bg-muted/20">
+                      <td className="px-2.5 py-1 font-sans font-medium text-foreground capitalize">
+                        {log.operationType.replaceAll("_", " ")}
+                        {log.messageId ? (
+                          <span className="ml-1 text-[10px] text-muted-foreground">
+                            (linked msg)
+                          </span>
+                        ) : null}
+                      </td>
+                      <td className="px-2.5 py-1 text-muted-foreground">{log.model}</td>
+                      <td className="px-2.5 py-1 text-right text-muted-foreground">
+                        {log.inputTokens.toLocaleString()} / {log.outputTokens.toLocaleString()}
+                      </td>
+                      <td className="px-2.5 py-1 text-right font-semibold text-foreground">
+                        {log.totalTokens.toLocaleString()}
+                      </td>
+                      <td className="px-2.5 py-1 text-right text-amber-700 dark:text-amber-300">
+                        {formatCostUsd(log.estimatedCostUsd)} ({formatCostInr(log.estimatedCostUsd)})
+                      </td>
+                      <td className="px-2.5 py-1 text-right text-muted-foreground font-sans">
+                        {new Date(log.createdAt).toLocaleString("en-IN", {
+                          day: "numeric",
+                          month: "short",
+                          hour: "numeric",
+                          minute: "2-digit",
+                        })}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
       )}

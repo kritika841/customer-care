@@ -12,6 +12,15 @@ export type MessageAttachment = {
   url?: string;
 };
 
+export type MessageTokenUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  estimatedCostUsd: number;
+  model: string;
+  operationType: string;
+};
+
 export type Message = {
   id: string;
   direction: string;
@@ -21,6 +30,7 @@ export type Message = {
   delivery_status: string;
   last_error: string;
   attachments: MessageAttachment[];
+  token_usage?: MessageTokenUsage | null;
 };
 
 export type Event = {
@@ -219,6 +229,16 @@ export const emptySupportSnapshot = {
   socialConnections: [],
   canManage: false,
   userId: "",
+  aiEscalations: [],
+  aiThreadTokenEstimate: 0,
+  aiChatTokenTotals: {
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    estimatedCostUsd: 0,
+    requestCount: 0,
+  },
+  aiChatTokenLogs: [],
   configured: false,
   pushConfigured: false,
   metaSystemConfigured: false,
@@ -315,4 +335,27 @@ export function getChannelBadge(channel?: string) {
         dotClass: "bg-primary",
       };
   }
+}
+
+export function formatTokensCompact(tokens: number): string {
+  const n = Math.max(0, Math.round(Number(tokens) || 0));
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 10_000) return `${(n / 1_000).toFixed(1)}k`;
+  return n.toLocaleString();
+}
+
+export function formatCostUsd(costUsd: number): string {
+  const c = Math.max(0, Number(costUsd) || 0);
+  if (c === 0) return "$0.00";
+  if (c < 0.0001) return `$${c.toFixed(6)}`;
+  if (c < 0.01) return `$${c.toFixed(4)}`;
+  return `$${c.toFixed(3)}`;
+}
+
+export function formatCostInr(costUsd: number, usdToInr = 85): string {
+  const inr = Math.max(0, Number(costUsd) || 0) * usdToInr;
+  if (inr === 0) return "₹0.00";
+  if (inr < 0.01) return `₹${inr.toFixed(4)}`;
+  if (inr < 1) return `₹${inr.toFixed(2)}`;
+  return `₹${inr.toFixed(2)}`;
 }

@@ -270,7 +270,7 @@ async function importThread(threadId: string, token: string) {
         const msgIso = new Date(Number(m.internalDate)).toISOString();
         const slaDueAt = computeSlaDueAt(msgIso, "normal");
         [ticket] =
-          await sql`INSERT INTO support_tickets(id,mailbox,gmail_thread_id,subject,customer_email,customer_name,reply_to_email,inbound_auth_verified,last_inbound_at,sla_due_at) VALUES(${randomUUID()},${mailbox()},${threadId},${subj},${effectiveCustomerEmail},${headers.get("from") || effectiveCustomerEmail},${replyTo},${authVerified},${msgIso}::timestamptz,${slaDueAt}::timestamptz) RETURNING *`;
+          await sql`INSERT INTO support_tickets(id,mailbox,gmail_thread_id,subject,customer_email,customer_name,reply_to_email,inbound_auth_verified,last_inbound_at,sla_due_at,created_at,updated_at) VALUES(${randomUUID()},${mailbox()},${threadId},${subj},${effectiveCustomerEmail},${headers.get("from") || effectiveCustomerEmail},${replyTo},${authVerified},${msgIso}::timestamptz,${slaDueAt}::timestamptz,${msgIso}::timestamptz,${msgIso}::timestamptz) RETURNING *`;
         await assignWaitingTickets(sql);
         await supportEvent(sql, "gmail", ticket.id, "created", {});
       }

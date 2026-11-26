@@ -24,7 +24,15 @@ async function handleGET(request: Request) {
     WHERE key IN ('sync_status', 'last_sync_at', 'last_sync_mode', 'last_sync_count', 'last_sync_error', 'fast_sync_checked_at', 'fast_sync_error')
   `).all<{ key: string; value: string }>();
   return Response.json({
-    logs: rows.results.map((row) => ({ ...row, details: JSON.parse(String(row.detailsJson || "{}")), detailsJson: undefined })),
+    logs: rows.results.map((row) => {
+      let details: Record<string, unknown> = {};
+      try {
+        details = JSON.parse(String(row.detailsJson || "{}"));
+      } catch {
+        details = {};
+      }
+      return { ...row, details, detailsJson: undefined };
+    }),
     sync: Object.fromEntries(stateRows.results.map((row) => [row.key, row.value])),
   });
 }

@@ -9,6 +9,7 @@ import {
   estimateTokenCount,
   generateStructuredJson,
   getConfiguredAiProviderInfo,
+  type AiTokenUsage,
 } from "./ai-provider";
 import {
   deleteKnowledgeDocument,
@@ -68,6 +69,11 @@ export type CompactedThreadContext = {
     createdAt: string;
   }>;
   promptReadyTranscript: string;
+  compactionUsage?: {
+    provider: string;
+    model: string;
+    usage: AiTokenUsage;
+  };
 };
 
 export type HumanActionCategory =
@@ -113,6 +119,210 @@ function parseStringArray(raw: unknown, fallback: string[] = []): string[] {
     }
   }
   return fallback;
+}
+
+export async function recordAiTokenUsage(params: {
+  ticketId?: string | null;
+  messageId?: string | null;
+  operationType:
+    | "triage"
+    | "compaction"
+    | "embedding"
+    | "rephrase"
+    | "decline_learning"
+    | "memory_command"
+    | "simulation";
+  provider: string;
+  model: string;
+  usage: AiTokenUsage;
+  actorId?: string;
+  details?: Record<string, unknown>;
+}): Promise<void> {
+  try {
+    const db = await operationsDb();
+    const id = `tok_${randomUUID()}`;
+    await db
+      .prepare(
+        `INSERT INTO support_ai_token_usage (
+          id, ticket_id, message_id, operation_type, provider, model,
+          input_tokens, output_tokens, total_tokens, estimated_cost_usd,
+          actor_id, details
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(
+        id,
+        params.ticketId || null,
+        params.messageId || null,
+        params.operationType,
+        String(params.provider || "unknown"),
+        String(params.model || "unknown"),
+        Math.max(0, Math.round(params.usage.inputTokens || 0)),
+        Math.max(0, Math.round(params.usage.outputTokens || 0)),
+        Math.max(0, Math.round(params.usage.totalTokens || 0)),
+        Number(params.usage.estimatedCostUsd || 0),
+        params.actorId || "ai_agent",
+        JSON.stringify({
+          ...(params.details || {}),
+          isEstimated: Boolean(params.usage.isEstimated),
+        }),
+      )
+      .run();
+  } catch (err) {
+    console.warn("[ai-token-usage] failed to record:", err instanceof Error ? err.message : err);
+  }
+}
+
+export async function getAiTokenSpendReport(days = 30) {
+  const safeDays = Math.min(365, Math.max(1, Math.round(days)));
+  const db = await operationsDb();
+  const sinceExpr = `now() - make_interval(days => ${safeDays})`;
+
+  const [totalsRow, byOpRes, byModelRes, byTicketRes, recentLogsRes] = await Promise.all([
+    db
+      .prepare(
+        `SELECT
+           COUNT(*)::int AS request_count,
+           COUNT(DISTINCT ticket_id) FILTER (WHERE ticket_id IS NOT NULL)::int AS chats_count,
+           COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
+           COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
+           COALESCE(SUM(total_tokens), 0)::bigint AS total_tokens,
+           COALESCE(SUM(estimated_cost_usd), 0)::float8 AS total_cost_usd
+         FROM support_ai_token_usage
+         WHERE created_at >= ${sinceExpr}`,
+      )
+      .first<Record<string, unknown>>(),
+    db
+      .prepare(
+        `SELECT
+           operation_type,
+           COUNT(*)::int AS request_count,
+           COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
+           COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
+           COALESCE(SUM(total_tokens), 0)::bigint AS total_tokens,
+           COALESCE(SUM(estimated_cost_usd), 0)::float8 AS total_cost_usd
+         FROM support_ai_token_usage
+         WHERE created_at >= ${sinceExpr}
+         GROUP BY operation_type
+         ORDER BY total_tokens DESC`,
+      )
+      .all<Record<string, unknown>>(),
+    db
+      .prepare(
+        `SELECT
+           provider,
+           model,
+           COUNT(*)::int AS request_count,
+           COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
+           COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
+           COALESCE(SUM(total_tokens), 0)::bigint AS total_tokens,
+           COALESCE(SUM(estimated_cost_usd), 0)::float8 AS total_cost_usd
+         FROM support_ai_token_usage
+         WHERE created_at >= ${sinceExpr}
+         GROUP BY provider, model
+         ORDER BY total_cost_usd DESC, total_tokens DESC`,
+      )
+      .all<Record<string, unknown>>(),
+    db
+      .prepare(
+        `SELECT
+           u.ticket_id,
+           t.ticket_number,
+           t.subject,
+           t.customer_name,
+           t.external_username,
+           t.channel,
+           COUNT(*)::int AS request_count,
+           COALESCE(SUM(u.input_tokens), 0)::bigint AS input_tokens,
+           COALESCE(SUM(u.output_tokens), 0)::bigint AS output_tokens,
+           COALESCE(SUM(u.total_tokens), 0)::bigint AS total_tokens,
+           COALESCE(SUM(u.estimated_cost_usd), 0)::float8 AS total_cost_usd,
+           MAX(u.created_at) AS last_used_at
+         FROM support_ai_token_usage u
+         LEFT JOIN support_tickets t ON t.id = u.ticket_id
+         WHERE u.created_at >= ${sinceExpr} AND u.ticket_id IS NOT NULL
+         GROUP BY u.ticket_id, t.ticket_number, t.subject, t.customer_name, t.external_username, t.channel
+         ORDER BY total_cost_usd DESC, total_tokens DESC
+         LIMIT 50`,
+      )
+      .all<Record<string, unknown>>(),
+    db
+      .prepare(
+        `SELECT
+           u.id, u.ticket_id, u.message_id, u.operation_type, u.provider, u.model,
+           u.input_tokens, u.output_tokens, u.total_tokens, u.estimated_cost_usd,
+           u.actor_id, u.details, u.created_at,
+           t.ticket_number, t.subject, t.customer_name, t.external_username, t.channel
+         FROM support_ai_token_usage u
+         LEFT JOIN support_tickets t ON t.id = u.ticket_id
+         WHERE u.created_at >= ${sinceExpr}
+         ORDER BY u.created_at DESC
+         LIMIT 100`,
+      )
+      .all<Record<string, unknown>>(),
+  ]);
+
+  const totals = {
+    days: safeDays,
+    requestCount: Number(totalsRow?.request_count || 0),
+    chatsCount: Number(totalsRow?.chats_count || 0),
+    inputTokens: Number(totalsRow?.input_tokens || 0),
+    outputTokens: Number(totalsRow?.output_tokens || 0),
+    totalTokens: Number(totalsRow?.total_tokens || 0),
+    totalCostUsd: Number(totalsRow?.total_cost_usd || 0),
+  };
+
+  return {
+    totals,
+    byOperation: (byOpRes.results || []).map((r) => ({
+      operationType: String(r.operation_type || ""),
+      requestCount: Number(r.request_count || 0),
+      inputTokens: Number(r.input_tokens || 0),
+      outputTokens: Number(r.output_tokens || 0),
+      totalTokens: Number(r.total_tokens || 0),
+      totalCostUsd: Number(r.total_cost_usd || 0),
+    })),
+    byModel: (byModelRes.results || []).map((r) => ({
+      provider: String(r.provider || ""),
+      model: String(r.model || ""),
+      requestCount: Number(r.request_count || 0),
+      inputTokens: Number(r.input_tokens || 0),
+      outputTokens: Number(r.output_tokens || 0),
+      totalTokens: Number(r.total_tokens || 0),
+      totalCostUsd: Number(r.total_cost_usd || 0),
+    })),
+    byChat: (byTicketRes.results || []).map((r) => ({
+      ticketId: String(r.ticket_id || ""),
+      ticketNumber: Number(r.ticket_number || 0),
+      subject: String(r.subject || ""),
+      customerName: String(r.customer_name || r.external_username || ""),
+      channel: String(r.channel || ""),
+      requestCount: Number(r.request_count || 0),
+      inputTokens: Number(r.input_tokens || 0),
+      outputTokens: Number(r.output_tokens || 0),
+      totalTokens: Number(r.total_tokens || 0),
+      totalCostUsd: Number(r.total_cost_usd || 0),
+      lastUsedAt: String(r.last_used_at || ""),
+    })),
+    recentRequests: (recentLogsRes.results || []).map((r) => ({
+      id: String(r.id || ""),
+      ticketId: r.ticket_id ? String(r.ticket_id) : null,
+      messageId: r.message_id ? String(r.message_id) : null,
+      ticketNumber: r.ticket_number ? Number(r.ticket_number) : null,
+      subject: String(r.subject || ""),
+      customerName: String(r.customer_name || r.external_username || ""),
+      channel: String(r.channel || ""),
+      operationType: String(r.operation_type || ""),
+      provider: String(r.provider || ""),
+      model: String(r.model || ""),
+      inputTokens: Number(r.input_tokens || 0),
+      outputTokens: Number(r.output_tokens || 0),
+      totalTokens: Number(r.total_tokens || 0),
+      estimatedCostUsd: Number(r.estimated_cost_usd || 0),
+      actorId: String(r.actor_id || ""),
+      details: String(r.details || "{}"),
+      createdAt: String(r.created_at || ""),
+    })),
+  };
 }
 
 export async function getAiSettings(): Promise<AiSettings> {
@@ -437,6 +647,7 @@ export async function buildCompactedThreadContext(params: {
   let summaryText = String(params.existingSummary || "").trim();
   let summaryUpToMessageId = String(params.existingSummaryUpToId || "").trim();
   let compactedNow = false;
+  let compactionUsage: CompactedThreadContext["compactionUsage"];
 
   const recentVerbatimMessages = shouldCompact
     ? normalizedMsgs.slice(-TAIL_COUNT)
@@ -463,7 +674,12 @@ export async function buildCompactedThreadContext(params: {
           )
           .join("\n");
 
-        const { data: summaryResult } = await generateStructuredJson<{
+        const {
+          data: summaryResult,
+          provider: compProvider,
+          model: compModel,
+          usage: compUsage,
+        } = await generateStructuredJson<{
           customerIntent: string;
           verifiedFacts: string;
           actionsAndPromises: string;
@@ -527,6 +743,11 @@ export async function buildCompactedThreadContext(params: {
         ].join("\n");
         summaryUpToMessageId = lastOlderId;
         compactedNow = true;
+        compactionUsage = {
+          provider: compProvider,
+          model: compModel,
+          usage: compUsage,
+        };
       }
     }
   }
@@ -586,6 +807,7 @@ export async function buildCompactedThreadContext(params: {
     pinnedFacts,
     recentVerbatimMessages,
     promptReadyTranscript,
+    compactionUsage,
   };
 }
 
@@ -1044,6 +1266,7 @@ export async function evaluateQueryWithStoreRag(params: {
   decision: AiAgentDecision;
   provider: string;
   model: string;
+  usage: AiTokenUsage;
 }> {
   const {
     channel,
@@ -1163,7 +1386,7 @@ Return JSON with fields:
       mandatoryEscalation,
     });
 
-  const { data: rawDecision, provider, model } = await generateStructuredJson<AiAgentDecision>({
+  const { data: rawDecision, provider, model, usage } = await generateStructuredJson<AiAgentDecision>({
     systemInstruction,
     userPrompt,
     temperature: 0.1,
@@ -1276,6 +1499,7 @@ Return JSON with fields:
     decision: finalDecision,
     provider,
     model,
+    usage,
   };
 }
 
@@ -1300,6 +1524,7 @@ export async function runAiAgentOnTicket(params: {
   escalationId: string | null;
   provider: string;
   model: string;
+  usage: AiTokenUsage;
   safeModeActive: boolean;
 }> {
   const db = await operationsDb();
@@ -1402,7 +1627,7 @@ export async function runAiAgentOnTicket(params: {
         "Customer",
     );
 
-    const { decision, provider, model } = await evaluateQueryWithStoreRag({
+    const { decision, provider, model, usage: triageUsage } = await evaluateQueryWithStoreRag({
       channel: String(ticket.channel || "email"),
       customerName: safeCustomerName,
       customerEmail: String(ticket.reply_to_email || ticket.customer_email || ""),
@@ -1651,6 +1876,47 @@ export async function runAiAgentOnTicket(params: {
       }
     });
 
+    await Promise.all([
+      compaction.compactionUsage
+        ? recordAiTokenUsage({
+            ticketId: params.ticketId,
+            messageId: String(latestInbound?.id || "") || null,
+            operationType: "compaction",
+            provider: compaction.compactionUsage.provider,
+            model: compaction.compactionUsage.model,
+            usage: compaction.compactionUsage.usage,
+            actorId: params.actorId || "ai_agent",
+            details: { compactedMessages: compaction.totalMessages },
+          })
+        : Promise.resolve(),
+      storeContext.embeddingUsage.totalTokens > 0
+        ? recordAiTokenUsage({
+            ticketId: params.ticketId,
+            messageId: String(latestInbound?.id || "") || null,
+            operationType: "embedding",
+            provider: "embedding",
+            model: storeContext.embeddingModel,
+            usage: storeContext.embeddingUsage,
+            actorId: params.actorId || "ai_agent",
+            details: { ragChunks: storeContext.ragChunks.length },
+          })
+        : Promise.resolve(),
+      recordAiTokenUsage({
+        ticketId: params.ticketId,
+        messageId: draftMessageId || String(latestInbound?.id || "") || null,
+        operationType: "triage",
+        provider,
+        model,
+        usage: triageUsage,
+        actorId: params.actorId || "ai_agent",
+        details: {
+          decision: decision.decision,
+          confidence: decision.confidence,
+          aiStatus: nextAiStatus,
+        },
+      }),
+    ]);
+
     return {
       ticketId: params.ticketId,
       aiStatus: nextAiStatus,
@@ -1662,6 +1928,7 @@ export async function runAiAgentOnTicket(params: {
       escalationId,
       provider,
       model,
+      usage: triageUsage,
       safeModeActive: !canQueueLiveOutbound,
     };
   } finally {
@@ -1692,6 +1959,7 @@ export async function rephraseAdminClarification(params: {
   canonicalAnswer: string;
   provider: string;
   model: string;
+  usage: AiTokenUsage;
 }> {
   const settings = await getAiSettings();
   const channel = String(params.channel || "email");
@@ -1704,7 +1972,7 @@ export async function rephraseAdminClarification(params: {
   const scrubbedQuery = scrubCustomerPii(cleanCustomerQuery, params.customerName);
   const scrubbedAdmin = scrubCustomerPii(cleanAdminAnswer, params.customerName);
 
-  const { data, provider, model } = await generateStructuredJson<{
+  const { data, provider, model, usage } = await generateStructuredJson<{
     customerReply: string;
     canonicalMemoryTitle: string;
     canonicalQuestion: string;
@@ -1780,6 +2048,7 @@ Return JSON with keys:
     ),
     provider,
     model,
+    usage,
   };
 }
 
@@ -1810,6 +2079,7 @@ export async function resolveAiEscalationWithAdminAnswer(params: {
   savedToMemory: boolean;
   memoryDocumentId: string | null;
   chunksIndexed: number;
+  usage: AiTokenUsage;
 }> {
   const db = await operationsDb();
 
@@ -1946,6 +2216,17 @@ export async function resolveAiEscalationWithAdminAnswer(params: {
     );
   });
 
+  await recordAiTokenUsage({
+    ticketId: params.ticketId,
+    messageId: draftMessageId,
+    operationType: "rephrase",
+    provider: rephrased.provider,
+    model: rephrased.model,
+    usage: rephrased.usage,
+    actorId: params.actorId,
+    details: { savedToMemory: params.saveToMemory },
+  });
+
   return {
     ok: true,
     rephrasedReply: finalCustomerReply,
@@ -1953,6 +2234,7 @@ export async function resolveAiEscalationWithAdminAnswer(params: {
     savedToMemory: params.saveToMemory,
     memoryDocumentId,
     chunksIndexed,
+    usage: rephrased.usage,
   };
 }
 
@@ -2004,12 +2286,40 @@ export async function simulateAiAgentQuery(params: {
     isSimulation: true,
   });
 
+  await Promise.all([
+    storeContext.embeddingUsage.totalTokens > 0
+      ? recordAiTokenUsage({
+          ticketId: null,
+          operationType: "embedding",
+          provider: "embedding",
+          model: storeContext.embeddingModel,
+          usage: storeContext.embeddingUsage,
+          actorId: "simulator",
+          details: { query: cleanQuery.slice(0, 120) },
+        })
+      : Promise.resolve(),
+    recordAiTokenUsage({
+      ticketId: null,
+      operationType: "simulation",
+      provider: evaluation.provider,
+      model: evaluation.model,
+      usage: evaluation.usage,
+      actorId: "simulator",
+      details: {
+        channel,
+        decision: evaluation.decision.decision,
+        confidence: evaluation.decision.confidence,
+      },
+    }),
+  ]);
+
   return {
     query: cleanQuery,
     channel,
     decision: evaluation.decision,
     provider: evaluation.provider,
     model: evaluation.model,
+    usage: evaluation.usage,
     storeContext: {
       orders: storeContext.orders,
       customer360: storeContext.customer360,
@@ -2236,7 +2546,12 @@ export async function recordDeclineAndMaybeLearn(params: {
     const scrubbedReason = scrubCustomerPii(params.declineReason, customerName);
     const scrubbedCorrected = scrubCustomerPii(params.correctedReply, customerName);
 
-    const { data: learned } = await generateStructuredJson<{
+    const {
+      data: learned,
+      provider: learnProvider,
+      model: learnModel,
+      usage: learnUsage,
+    } = await generateStructuredJson<{
       isOrderSpecific: boolean;
       orderSpecificReason: string;
       canonicalMemoryTitle: string;
@@ -2313,6 +2628,16 @@ Return JSON:
         chunksIndexed = upserted.chunksIndexed;
       }
     }
+
+    await recordAiTokenUsage({
+      ticketId: params.ticketId,
+      operationType: "decline_learning",
+      provider: learnProvider,
+      model: learnModel,
+      usage: learnUsage,
+      actorId: params.actorId,
+      details: { learnedToMemory, skipReason },
+    });
   }
 
   await db.transaction(async (sql) => {
@@ -2374,6 +2699,7 @@ export async function processAiMemoryCommand(params: {
   operations: MemoryToolOperationResult[];
   provider: string;
   model: string;
+  usage: AiTokenUsage;
 }> {
   const instruction = String(params.instruction || "").trim();
   if (!instruction) {
@@ -2388,6 +2714,13 @@ export async function processAiMemoryCommand(params: {
       operations: [{ op: "noop", summary: `Blocked order-specific memory: ${orderCheck.reason}` }],
       provider: "guardrail",
       model: "deterministic-safety",
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        estimatedCostUsd: 0,
+        isEstimated: false,
+      },
     };
   }
 
@@ -2399,7 +2732,7 @@ export async function processAiMemoryCommand(params: {
     updatedAt: String(d.updated_at || ""),
   }));
 
-  const { data: plan, provider, model } = await generateStructuredJson<{
+  const { data: plan, provider, model, usage } = await generateStructuredJson<{
     assistantReply: string;
     operations: Array<{
       op: "create" | "update" | "delete" | "noop";
@@ -2569,10 +2902,24 @@ Return JSON:
     }
   }
 
+  await recordAiTokenUsage({
+    ticketId: null,
+    operationType: "memory_command",
+    provider,
+    model,
+    usage,
+    actorId: params.actorId,
+    details: {
+      instruction: instruction.slice(0, 160),
+      operationsCount: executed.length,
+    },
+  });
+
   return {
     assistantReply: String(plan.assistantReply || "Updated AI Memory.").trim(),
     operations: executed,
     provider,
     model,
+    usage,
   };
 }

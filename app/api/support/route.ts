@@ -30,6 +30,7 @@ import {
 import {
   autoDraftPendingInboundTickets,
   getAiSettings,
+  getAiTokenSpendReport,
   processAiMemoryCommand,
   recordDeclineAndMaybeLearn,
   rephraseAdminClarification,
@@ -77,6 +78,11 @@ async function GETHandler(r: Request) {
       if (!manager(u)) throw new HttpError(403, "Manager access required");
       const days = Number(url.searchParams.get("days") || 14);
       return Response.json(await supportInsights(days));
+    }
+    if (mode === "token_usage") {
+      if (!manager(u)) throw new HttpError(403, "Manager access required");
+      const days = Number(url.searchParams.get("days") || 30);
+      return Response.json(await getAiTokenSpendReport(days));
     }
     if (mode === "knowledge") {
       if (!manager(u)) throw new HttpError(403, "Manager access required");

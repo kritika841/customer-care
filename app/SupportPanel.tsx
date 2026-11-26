@@ -33,6 +33,7 @@ import {
   Truck,
   Phone,
   Package,
+  Coins,
 } from "lucide-react";
 import SupportSidebar from "../components/SupportSidebar";
 import SupportTopBar from "../components/SupportTopBar";
@@ -44,6 +45,7 @@ import ExcelReviewTable, { type ExcelColumnDef } from "../components/ExcelReview
 import AgentQueueView from "../components/AgentQueueView";
 import OrderTrackingModal from "../components/OrderTrackingModal";
 import DeclineReplyModal from "../components/DeclineReplyModal";
+import FloatingMemoryDock from "../components/FloatingMemoryDock";
 import SupportErrorBoundary from "../components/SupportErrorBoundary";
 import SupportLogsView from "../components/SupportLogsView";
 import SupportSettingsView from "../components/SupportSettingsView";
@@ -58,7 +60,10 @@ import {
   extractLegacyAttachmentUrls,
   fileToBase64Attachment,
   formatBytes,
+  formatCostInr,
+  formatCostUsd,
   formatShortDate,
+  formatTokensCompact,
   getChannelBadge,
   getColumnSnapshot,
   getPriorityBadgeStyle,
@@ -104,7 +109,9 @@ export default function SupportPanel({
   const [page, setPage] = useState(1);
   const [queue, setQueue] = useState(initialView === "queue" ? "human_queue" : "all");
   const [channelFilter, setChannelFilter] = useState<"all" | "email" | "instagram" | "facebook">("all");
-  const [sortBy] = useState<"newest" | "fifo" | "sla">("newest");
+  const [sortBy, setSortBy] = useState<
+    "newest" | "oldest" | "needs_reply" | "updated" | "fifo" | "sla" | "ticket_desc" | "ticket_asc"
+  >("newest");
   const [search, setSearch] = useState(initialQuery);
   const [body, setBody] = useState("");
   const [noteBody, setNoteBody] = useState("");
@@ -728,11 +735,18 @@ export default function SupportPanel({
             <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground font-mono">
               <span>#{String(t.ticket_number).padStart(4, "0")}</span>
               <span>·</span>
-              <span>{formatShortDate(t.customer_last_at || t.updated_at)}</span>
+              <span>{formatShortDate(String(t.last_message_at || t.customer_last_at || t.updated_at))}</span>
             </div>
             {t.resolved_customer_phone && (
               <div className="inline-flex items-center gap-1 text-[10px] font-mono text-primary">
                 <Phone size={10} /> {t.resolved_customer_phone}
+              </div>
+            )}
+            {Number(t.ai_total_tokens || 0) > 0 && (
+              <div className="inline-flex items-center gap-1 rounded-full bg-amber-500/10 px-1.5 py-0.2 text-[10px] font-mono text-amber-700 dark:text-amber-300">
+                <Coins size={9} />
+                {formatTokensCompact(Number(t.ai_total_tokens))} tok ·{" "}
+                {formatCostUsd(Number(t.ai_total_cost_usd || 0))}
               </div>
             )}
           </div>
@@ -777,11 +791,20 @@ export default function SupportPanel({
               <p className="text-foreground leading-relaxed whitespace-pre-line">
                 {t.ai_reply_body}
               </p>
-              {t.ai_confidence != null && (
-                <span className="inline-block rounded-full bg-success/15 px-2 py-0.5 text-[10px] font-mono font-semibold text-success">
-                  Confidence: {Math.round(Number(t.ai_confidence) * 100)}%
-                </span>
-              )}
+              <div className="flex flex-wrap items-center gap-1.5">
+                {t.ai_confidence != null && (
+                  <span className="inline-block rounded-full bg-success/15 px-2 py-0.5 text-[10px] font-mono font-semibold text-success">
+                    Confidence: {Math.round(Number(t.ai_confidence) * 100)}%
+                  </span>
+                )}
+                {Number(t.ai_reply_tokens || 0) > 0 && (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] font-mono text-amber-700 dark:text-amber-300">
+                    <Coins size={9} />
+                    Msg: {formatTokensCompact(Number(t.ai_reply_tokens))} tok ·{" "}
+                    {formatCostUsd(Number(t.ai_reply_cost_usd || 0))}
+                  </span>
+                )}
+              </div>
             </div>
           );
         }
@@ -1021,7 +1044,7 @@ export default function SupportPanel({
       {/* MAIN FULL-WIDTH CONTENT */}
       {!inTicketWorkspace && (
       <main className="flex-1 min-w-0">
-        <div className="mx-auto w-full max-w-[1640px] px-4 sm:px-6 py-4 space-y-4">
+        <div className="mx-auto w-full max-w-[1640px] px-4 sm:px-6 py-4 pb-32 space-y-4">
           {/* Error / Notice Banners */}
           {error && (
             <div
@@ -1258,6 +1281,35 @@ export default function SupportPanel({
                     ))}
                   </select>
 
+                  <select
+                    aria-label="Sort queries"
+                    value={sortBy}
+                    onChange={(e) => {
+                      setSortBy(
+                        e.target.value as
+                          | "newest"
+                          | "oldest"
+                          | "needs_reply"
+                          | "updated"
+                          | "fifo"
+                          | "sla"
+                          | "ticket_desc"
+                          | "ticket_asc",
+                      );
+                      setPage(1);
+                    }}
+                    className="h-8 rounded-lg border border-border bg-card px-2.5 text-xs font-medium text-foreground outline-none focus:border-ring cursor-pointer"
+                  >
+                    <option value="newest">Sort: Newest Message</option>
+                    <option value="needs_reply">Sort: Needs Reply First</option>
+                    <option value="oldest">Sort: Oldest Message</option>
+                    <option value="updated">Sort: Recently Updated</option>
+                    <option value="fifo">Sort: Open Longest (FIFO)</option>
+                    <option value="sla">Sort: SLA Urgency</option>
+                    <option value="ticket_desc">Sort: Ticket # High → Low</option>
+                    <option value="ticket_asc">Sort: Ticket # Low → High</option>
+                  </select>
+
                   {canManage && (
                     <>
                       <Button
@@ -1389,13 +1441,20 @@ export default function SupportPanel({
                               {t.external_username || t.customer_name || t.customer_email}
                             </p>
                             <span className="text-[10px] text-muted-foreground shrink-0">
-                              {formatShortDate(t.customer_last_at || t.updated_at)}
+                              {formatShortDate(String(t.last_message_at || t.customer_last_at || t.updated_at))}
                             </span>
                           </div>
 
                           <p className="text-xs text-muted-foreground line-clamp-2 leading-relaxed">
                             {cleanQuery}
                           </p>
+                          {Number(t.ai_total_tokens || 0) > 0 && (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] font-mono text-amber-700 dark:text-amber-300">
+                              <Coins size={9} />
+                              {formatTokensCompact(Number(t.ai_total_tokens))} tok ·{" "}
+                              {formatCostUsd(Number(t.ai_total_cost_usd || 0))}
+                            </span>
+                          )}
                         </div>
 
                         <div className="pt-2 border-t border-border/50 flex items-center justify-between gap-2 text-[11px]">
@@ -1738,6 +1797,8 @@ export default function SupportPanel({
             }}
             escalations={(data.aiEscalations || []) as AiEscalationItem[]}
             threadTokenEstimate={Number(data.aiThreadTokenEstimate || 0)}
+            chatTokenTotals={data.aiChatTokenTotals}
+            chatTokenLogs={data.aiChatTokenLogs || []}
             compactionThreshold={Number(data.aiSettings?.compactionTokenThreshold || 10000)}
             approvalModeEnabled={approvalModeEnabled}
             latestInboundText={
@@ -1792,6 +1853,15 @@ export default function SupportPanel({
                                   "Customer"}
                             </strong>
                             <div className="flex items-center gap-2 shrink-0">
+                              {m.token_usage && m.token_usage.totalTokens > 0 && (
+                                <span
+                                  className="rounded-full bg-amber-500/10 px-2 py-0.5 font-mono text-[10px] text-amber-700 dark:text-amber-300"
+                                  title={`Model: ${m.token_usage.model} | In: ${m.token_usage.inputTokens} | Out: ${m.token_usage.outputTokens} | ${formatCostUsd(m.token_usage.estimatedCostUsd)} (${formatCostInr(m.token_usage.estimatedCostUsd)})`}
+                                >
+                                  {formatTokensCompact(m.token_usage.totalTokens)} tok ·{" "}
+                                  {formatCostUsd(m.token_usage.estimatedCostUsd)}
+                                </span>
+                              )}
                               <time className="text-[10px]">{formatShortDate(m.created_at)}</time>
                               {isOutbound && (
                                 <span
@@ -2453,6 +2523,14 @@ export default function SupportPanel({
         onAct={(action, b) => act(action, b)}
         busy={busy}
       />
+
+      {canManage && !inTicketWorkspace && (
+        <FloatingMemoryDock
+          memoryCount={Number(data.aiKnowledgeSummary?.adminMemoryCount || 0)}
+          onMemoryUpdated={() => void load()}
+          onOpenAiBrain={() => selectView("ai")}
+        />
+      )}
     </div>
   );
 }
