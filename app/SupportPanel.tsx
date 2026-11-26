@@ -576,7 +576,11 @@ export default function SupportPanel({
             version: targetVersion ?? ticket?.version,
             ...b,
           }),
-          signal: AbortSignal.timeout(action === "sync" ? 120000 : 30000),
+          signal: AbortSignal.timeout(
+            ["sync", "ai_batch_triage", "ai_run_ticket", "ai_knowledge_sync", "ai_knowledge_reembed", "ai_simulate"].includes(action)
+              ? 180000
+              : 60000
+          ),
         })
       );
       if (result.deleted) {
@@ -847,38 +851,63 @@ export default function SupportPanel({
       sortable: true,
       sortValue: (t) => String(t.order_tracking_id || t.order_code || ""),
       renderCell: (t) => {
-        if (!t.order_code && !t.order_tracking_id) {
+        if (!t.order_code && !t.order_tracking_id && !t.order_tracking_url) {
           return <span className="text-muted-foreground">—</span>;
         }
+        const openTrackingModal = (e: React.MouseEvent) => {
+          e.stopPropagation();
+          setTrackingTarget({
+            awb: String(t.order_tracking_id || ""),
+            orderId: t.order_id ? Number(t.order_id) : null,
+            orderCode: String(t.order_code || ""),
+            ticketId: t.id,
+            courier: String(t.order_courier || ""),
+            trackingUrl: String(t.order_tracking_url || ""),
+          });
+        };
         return (
           <div className="space-y-1">
             {t.order_code && (
-              <div className="inline-flex items-center gap-1 font-mono font-semibold text-foreground">
+              <button
+                type="button"
+                onClick={openTrackingModal}
+                title="View order & live tracking"
+                className="inline-flex items-center gap-1 font-mono font-semibold text-foreground hover:text-primary transition cursor-pointer"
+              >
                 <Package size={11} className="text-primary" /> {t.order_code}
-              </div>
+              </button>
             )}
-            {t.order_tracking_id ? (
-              <div>
+            {t.order_tracking_id || t.order_tracking_url ? (
+              <div className="flex items-center gap-1">
                 <button
                   type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setTrackingTarget({
-                      awb: String(t.order_tracking_id),
-                      orderId: t.order_id ? Number(t.order_id) : null,
-                      orderCode: String(t.order_code || ""),
-                      ticketId: t.id,
-                      courier: String(t.order_courier || ""),
-                    });
-                  }}
+                  onClick={openTrackingModal}
                   className="inline-flex items-center gap-1 rounded-full border border-primary/35 bg-primary/10 px-2 py-0.5 font-mono text-[10px] font-semibold text-primary hover:bg-primary hover:text-primary-foreground transition cursor-pointer"
                   title="One-click order tracking info"
                 >
-                  <Truck size={10} /> {t.order_tracking_id}
+                  <Truck size={10} /> {t.order_tracking_id || "Track Order"}
                 </button>
+                {t.order_tracking_url && (
+                  <a
+                    href={t.order_tracking_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => e.stopPropagation()}
+                    title="Open courier tracking page"
+                    className="inline-flex items-center justify-center rounded-full border border-border bg-background/60 p-1 text-muted-foreground hover:text-primary hover:border-primary/40 transition"
+                  >
+                    <ExternalLink size={10} />
+                  </a>
+                )}
               </div>
             ) : (
-              <span className="block text-[10px] text-muted-foreground">No AWB yet</span>
+              <button
+                type="button"
+                onClick={openTrackingModal}
+                className="inline-flex items-center gap-1 rounded-full border border-border bg-muted/40 px-2 py-0.5 text-[10px] font-medium text-muted-foreground hover:text-primary hover:border-primary/40 transition cursor-pointer"
+              >
+                <Truck size={10} /> Fetch tracking
+              </button>
             )}
           </div>
         );
@@ -1461,23 +1490,38 @@ export default function SupportPanel({
                         </div>
 
                         <div className="pt-2 border-t border-border/50 flex items-center justify-between gap-2 text-[11px]">
-                          {t.order_tracking_id ? (
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setTrackingTarget({
-                                  awb: String(t.order_tracking_id),
-                                  orderId: t.order_id ? Number(t.order_id) : null,
-                                  orderCode: String(t.order_code || ""),
-                                  ticketId: t.id,
-                                  courier: String(t.order_courier || ""),
-                                });
-                              }}
-                              className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 font-mono text-[10px] font-semibold text-primary hover:bg-primary hover:text-primary-foreground transition cursor-pointer"
-                            >
-                              <Truck size={10} /> {t.order_tracking_id}
-                            </button>
+                          {t.order_tracking_id || t.order_code ? (
+                            <div className="flex items-center gap-1">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setTrackingTarget({
+                                    awb: String(t.order_tracking_id || ""),
+                                    orderId: t.order_id ? Number(t.order_id) : null,
+                                    orderCode: String(t.order_code || ""),
+                                    ticketId: t.id,
+                                    courier: String(t.order_courier || ""),
+                                    trackingUrl: String(t.order_tracking_url || ""),
+                                  });
+                                }}
+                                className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 font-mono text-[10px] font-semibold text-primary hover:bg-primary hover:text-primary-foreground transition cursor-pointer"
+                              >
+                                <Truck size={10} /> {t.order_tracking_id || t.order_code}
+                              </button>
+                              {t.order_tracking_url && (
+                                <a
+                                  href={t.order_tracking_url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  onClick={(e) => e.stopPropagation()}
+                                  title="Open courier tracking page"
+                                  className="inline-flex items-center justify-center rounded-full border border-border bg-background/60 p-1 text-muted-foreground hover:text-primary hover:border-primary/40 transition"
+                                >
+                                  <ExternalLink size={10} />
+                                </a>
+                              )}
+                            </div>
                           ) : (
                             <span className="text-muted-foreground truncate">
                               {t.ai_reply_body ? "AI reply ready" : "Click to open"}

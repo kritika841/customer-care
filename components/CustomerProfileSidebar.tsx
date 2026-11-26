@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import {
+  ExternalLink,
   Link2,
   LockKeyhole,
   Mail,
@@ -480,30 +481,43 @@ export default function CustomerProfileSidebar({
                         {o.status}
                       </span>
                     </div>
-                    {(o.courier || o.awb) && (
+                    {(o.courier || o.awb || orderCode || o.tracking_url) && (
                       <div className="flex items-center justify-between gap-2">
                         <p className="text-[11px] text-muted-foreground font-mono truncate">
                           {o.courier ? `${o.courier} · ` : ""}
-                          {o.awb ? `Tracking: ${o.awb}` : ""}
+                          {o.awb ? `Tracking: ${o.awb}` : "Live tracking"}
                         </p>
-                        {o.awb && onTrackOrder && (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              onTrackOrder({
-                                awb: o.awb,
-                                orderId: o.id ?? null,
-                                orderCode,
-                                ticketId: ticket.id,
-                                courier: o.courier,
-                                trackingUrl: o.tracking_url,
-                              })
-                            }
-                            className="inline-flex shrink-0 items-center gap-1 rounded-full border border-primary/40 bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary hover:bg-primary hover:text-primary-foreground transition cursor-pointer"
-                          >
-                            <Truck size={10} /> Track
-                          </button>
-                        )}
+                        <div className="inline-flex shrink-0 items-center gap-1">
+                          {(o.awb || orderCode) && onTrackOrder && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                onTrackOrder({
+                                  awb: o.awb,
+                                  orderId: o.id ?? null,
+                                  orderCode,
+                                  ticketId: ticket.id,
+                                  courier: o.courier,
+                                  trackingUrl: o.tracking_url,
+                                })
+                              }
+                              className="inline-flex shrink-0 items-center gap-1 rounded-full border border-primary/40 bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary hover:bg-primary hover:text-primary-foreground transition cursor-pointer"
+                            >
+                              <Truck size={10} /> Track
+                            </button>
+                          )}
+                          {o.tracking_url && (
+                            <a
+                              href={o.tracking_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              title="Open courier tracking page"
+                              className="inline-flex shrink-0 items-center justify-center rounded-full border border-border bg-background/60 p-1 text-muted-foreground hover:text-primary hover:border-primary/40 transition"
+                            >
+                              <ExternalLink size={10} />
+                            </a>
+                          )}
+                        </div>
                       </div>
                     )}
                     {(o.total != null || o.payment_method) && (

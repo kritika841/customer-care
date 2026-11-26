@@ -30,6 +30,7 @@ const { formatTokensCompact, formatCostUsd, formatCostInr } = await import("../l
 const {
   slaMinutesForPriority,
   computeSlaDueAt,
+  expandOrderCodeVariants,
   extractOrderOrPhoneHints,
   computeCustomer360,
   evaluateSlaState,
@@ -1348,6 +1349,46 @@ test("Strict Claude Haiku 5.5 model lock, prompt caching, and anti-overspend bud
     if (prevTicketCap === undefined) delete process.env.AI_MAX_CALLS_PER_TICKET_24H;
     else process.env.AI_MAX_CALLS_PER_TICKET_24H = prevTicketCap;
   }
+});
+
+test("Satmi lookalike order code expansion, hint extraction, and Velocity tracking URLs", async () => {
+  const spaced = expandOrderCodeVariants("SIO 727479");
+  assert.ok(spaced.includes("SI0727479"), `Expected SI0727479 in ${JSON.stringify(spaced)}`);
+  assert.ok(spaced.includes("S10727479"));
+  assert.ok(spaced.includes("SIO727479"));
+
+  const hashLower = expandOrderCodeVariants("#s10729974");
+  assert.ok(hashLower.includes("SI0729974"));
+  assert.ok(hashLower.includes("S10729974"));
+
+  const slPrefix = expandOrderCodeVariants("SL0728472");
+  assert.ok(slPrefix.includes("SI0728472"));
+
+  const hints = extractOrderOrPhoneHints(
+    "Hi team, please check SIO 727479 and #s10729974 also order SIO729617. My mobile is +91 98765 43210."
+  );
+  assert.ok(hints.orderCodes.includes("SIO727479"));
+  assert.ok(hints.orderCodes.includes("S10729974"));
+  assert.ok(hints.orderCodes.includes("SIO729617"));
+  assert.equal(hints.orderCodes.includes("9876543210"), false);
+  assert.ok(hints.phones.includes("9876543210"));
+
+  assert.equal(
+    buildCourierTrackingUrl(
+      "xpressbees",
+      "153793960127735",
+      "https://www.velocityshipping.in/track/153793960127735"
+    ),
+    "https://www.velocityshipping.in/track/153793960127735"
+  );
+  assert.equal(
+    buildCourierTrackingUrl("Velocity Shipping", "153793960138402"),
+    "https://www.velocityshipping.in/track/153793960138402"
+  );
+  assert.equal(
+    buildCourierTrackingUrl("Xpressbees", "153793960138402"),
+    "https://www.xpressbees.com/shipment/tracking?awbNo=153793960138402"
+  );
 });
 
 

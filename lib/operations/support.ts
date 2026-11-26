@@ -8,12 +8,17 @@ import { manager } from "./access";
 import {
   computeCustomer360,
   computeSlaDueAt,
+  expandOrderCodeVariants,
   extractOrderOrPhoneHints,
   type Customer360Summary,
 } from "./sla";
 import { estimateTokenCount } from "./ai-provider";
 import { getAiSettings, type AiSettings } from "./ai-agent";
-import { buildCourierTrackingUrl } from "./rag";
+import {
+  buildCourierTrackingUrl,
+  extractRawTrackingUrl,
+  fetchShopifyFulfillmentForOrder,
+} from "./rag";
 
 // Support records combine ticket, mailbox and user tables. Mutation inputs are
 // validated below; the workspace reads the selected row's dynamic columns.
@@ -500,6 +505,7 @@ export async function supportData(
            COALESCE(ord.awb, '') AS order_tracking_id,
            COALESCE(ord.courier, '') AS order_courier,
            COALESCE(ord.status, '') AS order_status,
+           COALESCE(ord.raw_json::text, '') AS order_raw_json,
            COALESCE(NULLIF(support_tickets.associated_phone, ''), scl.customer_phone, ord.customer_phone, '') AS resolved_customer_phone,
            COALESCE(latest_msg.excerpt, '') AS excerpt,
            COALESCE(latest_msg.direction, '') AS last_direction,
@@ -912,7 +918,10 @@ export async function supportData(
       orderParams.push(resolvedPhone);
     }
     if (!linkedOrderId && hints.orderCodes.length) {
-      for (const code of hints.orderCodes) {
+      const lookupCodes = Array.from(
+        new Set(hints.orderCodes.flatMap((code) => expandOrderCodeVariants(code)))
+      ).slice(0, 18);
+      for (const code of lookupCodes) {
         orderClauses.push("UPPER(REPLACE(channel_order_id, '#', '')) = ?");
         orderParams.push(code);
       }
@@ -937,9 +946,54 @@ export async function supportData(
         .bind(...orderParams)
         .all<Record<string, unknown>>()
         .catch(() => ({ results: [] as Record<string, unknown>[] }));
-      orders = (orderRows.results as SupportRow[]).map((o) => ({
+
+      const enrichedRows = orderRows.results as SupportRow[];
+      if (
+        enrichedRows[0] &&
+        (!enrichedRows[0].awb ||
+          /^self\s+fulfilled$/i.test(String(enrichedRows[0].status || "")))
+      ) {
+        const sf = await fetchShopifyFulfillmentForOrder(
+          String(enrichedRows[0].channel_order_id || ""),
+          enrichedRows[0],
+        ).catch(() => null);
+        if (sf) {
+          if (!enrichedRows[0].awb && sf.awb) enrichedRows[0].awb = sf.awb;
+          if (
+            (!enrichedRows[0].courier || /^other$/i.test(String(enrichedRows[0].courier))) &&
+            sf.courier
+          ) {
+            enrichedRows[0].courier = sf.courier;
+          }
+          if (/^self\s+fulfilled$/i.test(String(enrichedRows[0].status || "")) && sf.status) {
+            enrichedRows[0].status = sf.status;
+          }
+          if (!enrichedRows[0].customer_phone && sf.phone) {
+            enrichedRows[0].customer_phone = sf.phone;
+          }
+          if (sf.trackingUrl) {
+            enrichedRows[0]._shopify_tracking_url = sf.trackingUrl;
+          }
+        }
+      }
+
+      if (!selectedTicket.order_id && enrichedRows[0]?.id) {
+        const matchedId = Number(enrichedRows[0].id);
+        await db
+          .prepare("UPDATE support_tickets SET order_id = COALESCE(order_id, ?) WHERE id = ?")
+          .bind(matchedId, id)
+          .run()
+          .catch(() => null);
+        selectedTicket.order_id = matchedId;
+      }
+
+      orders = enrichedRows.map((o) => ({
         ...o,
-        tracking_url: buildCourierTrackingUrl(String(o.courier || ""), String(o.awb || "")),
+        tracking_url: buildCourierTrackingUrl(
+          String(o.courier || ""),
+          String(o.awb || ""),
+          String(o._shopify_tracking_url || extractRawTrackingUrl(o.raw_json) || ""),
+        ),
       }));
     }
 
@@ -1028,6 +1082,11 @@ export async function supportData(
   return {
     tickets: (ticketRows.results as SupportRow[]).map((t) => ({
       ...t,
+      order_tracking_url: buildCourierTrackingUrl(
+        String(t.order_courier || ""),
+        String(t.order_tracking_id || ""),
+        extractRawTrackingUrl(t.order_raw_json),
+      ),
       tags: parseJsonArray(t.tags),
     })),
     selectedTicket: selectedTicket

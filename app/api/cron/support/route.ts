@@ -3,6 +3,7 @@ import { errorResponse as requestErrorResponse } from "../../../../lib/http";
 import { timingSafeEqual } from "node:crypto";
 import { runSupport } from "../../../../lib/operations/gmail";
 import { syncMetaInboxes, flushMetaOutbox } from "../../../../lib/operations/meta";
+import { autoLinkTicketsToOrders, syncRecentShopifyFulfillmentsToOrders } from "../../../../lib/operations/rag";
 import { autoDraftPendingInboundTickets } from "../../../../lib/operations/ai-agent";
 import { errorResponse } from "../../../../lib/http";
 export const maxDuration = 300;
@@ -25,8 +26,10 @@ async function GETHandler(r: Request) {
       error: err instanceof Error ? err.message : "Meta sync skipped",
     }));
     await flushMetaOutbox().catch(() => null);
+    const shopify = await syncRecentShopifyFulfillmentsToOrders(150).catch(() => null);
+    const linked = await autoLinkTicketsToOrders(80).catch(() => null);
     const ai = await autoDraftPendingInboundTickets(15).catch(() => null);
-    return Response.json({ ok: true, gmail, meta, ai });
+    return Response.json({ ok: true, gmail, meta, shopify, linked, ai });
   } catch (e) {
     return errorResponse(e);
   }

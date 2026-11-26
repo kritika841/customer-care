@@ -21,6 +21,24 @@ export function computeSlaDueAt(
   ).toISOString();
 }
 
+export function expandOrderCodeVariants(rawCode: string): string[] {
+  const clean = String(rawCode || "")
+    .replace(/^#/, "")
+    .replace(/[\s:-]+/g, "")
+    .trim()
+    .toUpperCase();
+  if (!clean) return [];
+  const variants = new Set<string>([clean]);
+  // Common customer typos for Satmi's `SI0...` Shopify/Shiprocket prefix (SIO, S10, S1O, SL0)
+  const satmiMatch = clean.match(/^(?:SI0|SIO|S10|S1O|SLO|SL0)(\d{5,})$/);
+  if (satmiMatch?.[1]) {
+    variants.add(`SI0${satmiMatch[1]}`);
+    variants.add(`S10${satmiMatch[1]}`);
+    variants.add(`SIO${satmiMatch[1]}`);
+  }
+  return [...variants];
+}
+
 export function extractOrderOrPhoneHints(text: string): {
   orderCodes: string[];
   phones: string[];
@@ -29,21 +47,31 @@ export function extractOrderOrPhoneHints(text: string): {
   const orderCodes = new Set<string>();
   const phones = new Set<string>();
 
-  // Match #S10729974, S10729974, SI0715783, #12345, etc.
-  const orderMatches = clean.matchAll(/(?:#|\b)([A-Z]{1,4}\d{5,}|#\d{4,})\b/gi);
+  // Match contiguous #S10729974, S10729974, SI0715783, SIO729617, #12345, etc.
+  const orderMatches = clean.matchAll(/(?:#|\b)([A-Z0-9]{1,4}\d{5,}|#\d{4,})\b/gi);
   for (const m of orderMatches) {
-    const raw = (m[1] || m[0]).replace(/^#/, "").trim().toUpperCase();
-    if (raw.length >= 4 && raw.length <= 24) orderCodes.add(raw);
+    const token = (m[1] || m[0]).replace(/^#/, "").trim().toUpperCase();
+    // Skip pure 10-digit Indian mobile numbers accidentally caught without `#`
+    if (/^[6-9]\d{9}$/.test(token)) continue;
+    if (token.length >= 4 && token.length <= 24) orderCodes.add(token);
   }
 
-  // Match 10-digit Indian phone numbers (optionally prefixed with +91 / 91 / 0)
-  const phoneMatches = clean.matchAll(/(?:\+?91[\s-]?|0)?([6-9]\d{9})\b/g);
+  // Also match space-separated Satmi order codes like "SIO 727479", "SI0 729974", "S10 729974"
+  const spacedMatches = clean.matchAll(/(?:#|\b)(S[I1L][0O])\s*[-:]?\s*(\d{5,})\b/gi);
+  for (const m of spacedMatches) {
+    const token = `${m[1]}${m[2]}`.toUpperCase();
+    if (token.length >= 4 && token.length <= 24) orderCodes.add(token);
+  }
+
+  // Match 10-digit Indian phone numbers (optionally prefixed with +91 / 91 / 0, allowing inner space/dash)
+  const phoneMatches = clean.matchAll(/(?:\+?91[\s-]?|0)?([6-9]\d{4}[\s-]?\d{5})\b/g);
   for (const m of phoneMatches) {
-    if (m[1]) phones.add(m[1]);
+    const digits = String(m[1] || "").replace(/[\s-]+/g, "");
+    if (/^[6-9]\d{9}$/.test(digits)) phones.add(digits);
   }
 
   return {
-    orderCodes: [...orderCodes].slice(0, 6),
+    orderCodes: [...orderCodes].slice(0, 12),
     phones: [...phones].slice(0, 4),
   };
 }

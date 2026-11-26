@@ -20,10 +20,12 @@ import {
   flushMetaOutbox,
 } from "../../../lib/operations/meta";
 import {
+  autoLinkTicketsToOrders,
   deleteKnowledgeDocument,
   fetchLiveOrderTrackingInfo,
   listKnowledgeDocuments,
   repairKnowledgeChunkEmbeddings,
+  syncRecentShopifyFulfillmentsToOrders,
   syncStoreKnowledgeToRag,
   upsertKnowledgeDocument,
   type KnowledgeCategory,
@@ -625,9 +627,16 @@ async function POSTHandler(r: Request) {
       }));
       await flushMetaOutbox().catch(() => null);
 
-      // Automatically prepare AI draft / auto-send responses for newly synced inbound tickets
-      await autoDraftPendingInboundTickets(15).catch(() => null);
+      // Enrich recent SELF FULFILLED / Velocity orders via Shopify Admin API and link unlinked tickets
+      const shopifyFulfillments = await syncRecentShopifyFulfillmentsToOrders(120).catch(() => null);
+      const linkedTickets = await autoLinkTicketsToOrders(60).catch(() => null);
+
+      // Interactive Sync Now caps synchronous AI auto-drafts at 3 tickets to stay well under Nginx proxy timeouts;
+      // background cron handles larger sweeps every 5 minutes.
+      await autoDraftPendingInboundTickets(3).catch(() => null);
       await Promise.allSettled([flushOutbox(), flushMetaOutbox()]);
+      void shopifyFulfillments;
+      void linkedTickets;
 
       const channelNotes = Object.entries(metaResult.channels || {})
         .filter(([, info]) => Boolean(info.error))
@@ -696,7 +705,7 @@ async function POSTHandler(r: Request) {
 }
 
 export async function GET(...args: Parameters<typeof GETHandler>) {
-  try { return await withRequestDatabase(() => GETHandler(...args), 20000); }
+  try { return await withRequestDatabase(() => GETHandler(...args), 35000); }
   catch (error) { return requestErrorResponse(error); }
 }
 

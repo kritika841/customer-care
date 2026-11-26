@@ -136,7 +136,12 @@ export default function OrderTrackingModal({
                   </p>
                 )}
                 <p className="text-[10px] text-muted-foreground">
-                  Source: {tracking.source === "shiprocket_live" ? "Live Shiprocket Tracking" : "Order Database Snapshot"}
+                  Source:{" "}
+                  {tracking.source === "shiprocket_live"
+                    ? "Live Shiprocket Tracking"
+                    : tracking.source === "shopify_live"
+                      ? "Live Shopify / Courier Fulfillment"
+                      : "Order Database Snapshot"}
                 </p>
               </div>
 

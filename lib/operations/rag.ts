@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { isPgVectorAvailable, operationsDb } from "./schema";
-import { computeCustomer360, extractOrderOrPhoneHints, type Customer360Summary } from "./sla";
+import {
+  computeCustomer360,
+  expandOrderCodeVariants,
+  extractOrderOrPhoneHints,
+  type Customer360Summary,
+} from "./sla";
 import {
   cosineSimilarity,
   DEFAULT_GEMINI_EMBED_MODELS,
@@ -1572,7 +1577,10 @@ async function lookupLiveOrdersFromIntegrations(params: {
 
   // 1. Shopify Admin API Order Lookup
   if (shopifyHost && shopifyToken) {
-    for (const code of params.orderCodes.slice(0, 3)) {
+    const shopifyCodes = Array.from(
+      new Set(params.orderCodes.slice(0, 3).flatMap((c) => expandOrderCodeVariants(c)))
+    ).slice(0, 6);
+    for (const code of shopifyCodes) {
       try {
         const res = await fetch(
           `https://${shopifyHost}/admin/api/${encodeURIComponent(
@@ -1736,10 +1744,36 @@ async function lookupLiveOrdersFromIntegrations(params: {
   return results;
 }
 
-export function buildCourierTrackingUrl(courier: string, awb: string): string {
+export function extractRawTrackingUrl(rawJson: unknown): string {
+  if (!rawJson) return "";
+  try {
+    const obj = typeof rawJson === "string" ? JSON.parse(rawJson) : rawJson;
+    if (!obj || typeof obj !== "object") return "";
+    const rec = obj as Record<string, unknown>;
+    const candidate = String(
+      rec.shopify_tracking_url || rec.tracking_url || rec.trackingUrl || "",
+    ).trim();
+    return /^https?:\/\//i.test(candidate) ? candidate : "";
+  } catch {
+    return "";
+  }
+}
+
+export function buildCourierTrackingUrl(
+  courier: string,
+  awb: string,
+  preferredUrl?: string,
+): string {
+  const cleanPreferred = String(preferredUrl || "").trim();
+  if (/^https?:\/\//i.test(cleanPreferred)) {
+    return cleanPreferred;
+  }
   const cleanAwb = String(awb || "").trim();
   if (!cleanAwb) return "";
   const lowerCourier = String(courier || "").toLowerCase();
+  if (lowerCourier.includes("velocity")) {
+    return `https://www.velocityshipping.in/track/${encodeURIComponent(cleanAwb)}`;
+  }
   if (lowerCourier.includes("delhivery")) {
     return `https://www.delhivery.com/track-v2/package/${encodeURIComponent(cleanAwb)}`;
   }
@@ -1771,8 +1805,413 @@ export type OrderTrackingDetails = {
   currentLocation: string;
   ndrReason: string;
   activities: Array<{ date: string; status: string; activity: string; location: string }>;
-  source: "shiprocket_live" | "local_db";
+  source: "shiprocket_live" | "shopify_live" | "local_db";
 };
+
+function getShopifyAdminConfig(): { host: string; token: string; version: string } | null {
+  const rawDomain = (
+    process.env.SHOPIFY_SHOP_DOMAIN ||
+    process.env.SHOPIFY_STORE_DOMAIN ||
+    ""
+  ).trim();
+  const token = (process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || "").trim();
+  if (!rawDomain || !token) return null;
+  const host = rawDomain.replace(/^https?:\/\//i, "").replace(/\/.*$/, "").trim();
+  if (!host) return null;
+  return {
+    host,
+    token,
+    version: (process.env.SHOPIFY_API_VERSION || "2026-04").trim(),
+  };
+}
+
+function parseShopifyFulfillment(o: Record<string, unknown>) {
+  const fulfillments = Array.isArray(o.fulfillments)
+    ? (o.fulfillments as Array<Record<string, unknown>>)
+    : [];
+  const latestFul = fulfillments[fulfillments.length - 1] || {};
+  const customerObj = (o.customer || {}) as Record<string, unknown>;
+  const shippingObj = (o.shipping_address || {}) as Record<string, unknown>;
+  const awb = String(latestFul.tracking_number || "").trim();
+  const courier = String(latestFul.tracking_company || "").trim();
+  const urls = Array.isArray(latestFul.tracking_urls)
+    ? latestFul.tracking_urls.map(String)
+    : [];
+  const trackingUrl = String(latestFul.tracking_url || urls[0] || "").trim();
+  const shipmentStatus = String(
+    o.cancelled_at
+      ? "CANCELED"
+      : latestFul.shipment_status || o.fulfillment_status || "",
+  )
+    .replaceAll("_", " ")
+    .toUpperCase()
+    .trim();
+  const phone = String(
+    o.phone || shippingObj.phone || customerObj.phone || "",
+  ).trim();
+  const email = String(o.email || customerObj.email || "").trim();
+  return {
+    name: String(o.name || o.order_number || "").replace(/^#/, "").trim().toUpperCase(),
+    awb,
+    courier,
+    trackingUrl,
+    shipmentStatus,
+    phone,
+    email,
+  };
+}
+
+export async function fetchShopifyFulfillmentForOrder(
+  orderCode: string,
+  existingOrderRow?: Record<string, unknown> | null,
+): Promise<{
+  awb: string;
+  courier: string;
+  trackingUrl: string;
+  status: string;
+  phone: string;
+  email: string;
+} | null> {
+  const cfg = getShopifyAdminConfig();
+  if (!cfg || !orderCode) return null;
+
+  for (const variant of expandOrderCodeVariants(orderCode).slice(0, 2)) {
+    const queryName = `#${variant.replace(/^#/, "")}`;
+    try {
+      const res = await fetch(
+        `https://${cfg.host}/admin/api/${encodeURIComponent(cfg.version)}/orders.json?status=any&name=${encodeURIComponent(
+          queryName,
+        )}&limit=2&fields=id,name,email,phone,fulfillment_status,fulfillments,shipping_address,customer,cancelled_at`,
+        {
+          headers: {
+            "X-Shopify-Access-Token": cfg.token,
+            Accept: "application/json",
+          },
+          signal: AbortSignal.timeout(8000),
+        },
+      );
+      if (!res.ok) continue;
+      const payload = (await res.json()) as { orders?: Array<Record<string, unknown>> };
+      const matched = payload.orders?.[0];
+      if (!matched) continue;
+      const parsed = parseShopifyFulfillment(matched);
+
+      // Persist self-healed AWB / courier / tracking_url / phone onto local `orders` row if present
+      if (existingOrderRow?.id && (parsed.awb || parsed.trackingUrl || parsed.phone)) {
+        try {
+          const db = await operationsDb();
+          let existingRaw: Record<string, unknown> = {};
+          try {
+            existingRaw =
+              typeof existingOrderRow.raw_json === "string"
+                ? JSON.parse(existingOrderRow.raw_json)
+                : ((existingOrderRow.raw_json as Record<string, unknown>) || {});
+          } catch {
+            existingRaw = {};
+          }
+          const updatedRaw = JSON.stringify({
+            ...existingRaw,
+            ...(parsed.trackingUrl ? { shopify_tracking_url: parsed.trackingUrl } : {}),
+            ...(parsed.shipmentStatus ? { shopify_shipment_status: parsed.shipmentStatus } : {}),
+          });
+          await db
+            .prepare(
+              `UPDATE orders
+               SET awb = CASE WHEN COALESCE(awb, '') = '' AND ? <> '' THEN ? ELSE awb END,
+                   courier = CASE WHEN COALESCE(courier, '') IN ('', 'OTHER') AND ? <> '' THEN ? ELSE courier END,
+                   status = CASE WHEN UPPER(COALESCE(status, '')) = 'SELF FULFILLED' AND ? <> '' THEN ? ELSE status END,
+                   customer_phone = CASE WHEN COALESCE(customer_phone, '') = '' AND ? <> '' THEN ? ELSE customer_phone END,
+                   customer_email = CASE WHEN COALESCE(customer_email, '') = '' AND ? <> '' THEN ? ELSE customer_email END,
+                   raw_json = ?,
+                   synced_at = now()
+               WHERE id = ?`,
+            )
+            .bind(
+              parsed.awb,
+              parsed.awb,
+              parsed.courier,
+              parsed.courier,
+              parsed.shipmentStatus,
+              parsed.shipmentStatus,
+              parsed.phone,
+              parsed.phone,
+              parsed.email,
+              parsed.email,
+              updatedRaw,
+              existingOrderRow.id,
+            )
+            .run()
+            .catch(() => null);
+        } catch {
+          // Non-fatal persistence update
+        }
+      }
+
+      return {
+        awb: parsed.awb,
+        courier: parsed.courier,
+        trackingUrl: parsed.trackingUrl,
+        status: parsed.shipmentStatus,
+        phone: parsed.phone,
+        email: parsed.email,
+      };
+    } catch {
+      // Non-fatal Shopify API error
+    }
+  }
+  return null;
+}
+
+export async function syncRecentShopifyFulfillmentsToOrders(limit = 250): Promise<{
+  fetched: number;
+  updated: number;
+}> {
+  const cfg = getShopifyAdminConfig();
+  if (!cfg) return { fetched: 0, updated: 0 };
+  try {
+    const safeLimit = Math.min(250, Math.max(20, Math.round(limit)));
+    const res = await fetch(
+      `https://${cfg.host}/admin/api/${encodeURIComponent(
+        cfg.version,
+      )}/orders.json?status=any&fulfillment_status=shipped&limit=${safeLimit}&fields=id,name,email,phone,fulfillment_status,fulfillments,shipping_address,customer,cancelled_at`,
+      {
+        headers: {
+          "X-Shopify-Access-Token": cfg.token,
+          Accept: "application/json",
+        },
+        signal: AbortSignal.timeout(15000),
+      },
+    );
+    if (!res.ok) return { fetched: 0, updated: 0 };
+    const payload = (await res.json()) as { orders?: Array<Record<string, unknown>> };
+    const shopOrders = payload.orders || [];
+    if (shopOrders.length === 0) return { fetched: 0, updated: 0 };
+
+    const db = await operationsDb();
+    let updated = 0;
+    for (const o of shopOrders) {
+      const parsed = parseShopifyFulfillment(o);
+      if (!parsed.name || (!parsed.awb && !parsed.trackingUrl && !parsed.phone)) continue;
+      const existing = await db
+        .prepare(
+          "SELECT id, awb, courier, status, customer_phone, customer_email, raw_json FROM orders WHERE UPPER(REPLACE(channel_order_id, '#', '')) = ? LIMIT 1",
+        )
+        .bind(parsed.name)
+        .first<Record<string, unknown>>()
+        .catch(() => null);
+      if (!existing?.id) continue;
+
+      const needsUpdate =
+        (!existing.awb && parsed.awb) ||
+        (!existing.customer_phone && parsed.phone) ||
+        !extractRawTrackingUrl(existing.raw_json);
+      if (!needsUpdate) continue;
+
+      let existingRaw: Record<string, unknown> = {};
+      try {
+        existingRaw =
+          typeof existing.raw_json === "string"
+            ? JSON.parse(existing.raw_json)
+            : ((existing.raw_json as Record<string, unknown>) || {});
+      } catch {
+        existingRaw = {};
+      }
+      const nextRaw = JSON.stringify({
+        ...existingRaw,
+        ...(parsed.trackingUrl ? { shopify_tracking_url: parsed.trackingUrl } : {}),
+        ...(parsed.shipmentStatus ? { shopify_shipment_status: parsed.shipmentStatus } : {}),
+      });
+
+      await db
+        .prepare(
+          `UPDATE orders
+           SET awb = CASE WHEN COALESCE(awb, '') = '' AND ? <> '' THEN ? ELSE awb END,
+               courier = CASE WHEN COALESCE(courier, '') IN ('', 'OTHER') AND ? <> '' THEN ? ELSE courier END,
+               status = CASE WHEN UPPER(COALESCE(status, '')) = 'SELF FULFILLED' AND ? <> '' THEN ? ELSE status END,
+               customer_phone = CASE WHEN COALESCE(customer_phone, '') = '' AND ? <> '' THEN ? ELSE customer_phone END,
+               customer_email = CASE WHEN COALESCE(customer_email, '') = '' AND ? <> '' THEN ? ELSE customer_email END,
+               raw_json = ?,
+               synced_at = now()
+           WHERE id = ?`,
+        )
+        .bind(
+          parsed.awb,
+          parsed.awb,
+          parsed.courier,
+          parsed.courier,
+          parsed.shipmentStatus,
+          parsed.shipmentStatus,
+          parsed.phone,
+          parsed.phone,
+          parsed.email,
+          parsed.email,
+          nextRaw,
+          existing.id,
+        )
+        .run()
+        .catch(() => null);
+      updated++;
+    }
+    return { fetched: shopOrders.length, updated };
+  } catch {
+    return { fetched: 0, updated: 0 };
+  }
+}
+
+export async function findAndLinkOrderForTicket(ticketId: string): Promise<number | null> {
+  const db = await operationsDb();
+  const ticket = await db
+    .prepare(
+      "SELECT id, channel, subject, customer_email, customer_name, external_user_id, associated_phone, order_id FROM support_tickets WHERE id = ? LIMIT 1",
+    )
+    .bind(ticketId)
+    .first<Record<string, unknown>>()
+    .catch(() => null);
+  if (!ticket) return null;
+  if (ticket.order_id) return Number(ticket.order_id);
+
+  const msgs = await db
+    .prepare(
+      "SELECT body FROM support_messages WHERE ticket_id = ? AND direction = 'inbound' ORDER BY created_at DESC LIMIT 8",
+    )
+    .bind(ticketId)
+    .all<{ body: string }>()
+    .catch(() => ({ results: [] as { body: string }[] }));
+
+  const text = [
+    String(ticket.subject || ""),
+    ...msgs.results.map((m) => String(m.body || "")),
+  ].join("\n");
+  const hints = extractOrderOrPhoneHints(text);
+  const ticketEmail = String(ticket.customer_email || "").trim();
+  const validEmail =
+    ticketEmail &&
+    !ticketEmail.endsWith("@facebook.com") &&
+    !ticketEmail.startsWith("@") &&
+    ticketEmail.includes("@")
+      ? ticketEmail
+      : "";
+  const phoneList = [
+    ...(ticket.associated_phone ? [String(ticket.associated_phone)] : []),
+    ...hints.phones,
+  ].filter(Boolean);
+
+  if (hints.orderCodes.length === 0 && phoneList.length === 0 && !validEmail) {
+    return null;
+  }
+
+  let matchedOrder: Record<string, unknown> | null = null;
+  if (hints.orderCodes.length > 0) {
+    const lookupCodes = Array.from(
+      new Set(hints.orderCodes.slice(0, 4).flatMap((c) => expandOrderCodeVariants(c)))
+    );
+    for (const code of lookupCodes) {
+      matchedOrder = await db
+        .prepare(
+          "SELECT id, channel_order_id, awb, courier, status, customer_phone, customer_email, raw_json FROM orders WHERE UPPER(REPLACE(channel_order_id, '#', '')) = ? LIMIT 1",
+        )
+        .bind(code)
+        .first<Record<string, unknown>>()
+        .catch(() => null);
+      if (matchedOrder) break;
+    }
+  }
+  if (!matchedOrder && phoneList.length > 0) {
+    for (const phone of phoneList.slice(0, 3)) {
+      matchedOrder = await db
+        .prepare(
+          "SELECT id, channel_order_id, awb, courier, status, customer_phone, customer_email, raw_json FROM orders WHERE RIGHT(REGEXP_REPLACE(customer_phone, '[^0-9]', '', 'g'), 10) = RIGHT(?, 10) ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(phone)
+        .first<Record<string, unknown>>()
+        .catch(() => null);
+      if (matchedOrder) break;
+    }
+  }
+  if (!matchedOrder && validEmail) {
+    matchedOrder = await db
+      .prepare(
+        "SELECT id, channel_order_id, awb, courier, status, customer_phone, customer_email, raw_json FROM orders WHERE LOWER(customer_email) = LOWER(?) ORDER BY created_at DESC LIMIT 1",
+      )
+      .bind(validEmail)
+      .first<Record<string, unknown>>()
+      .catch(() => null);
+  }
+
+  if (!matchedOrder?.id) return null;
+
+  // Enrich if SELF FULFILLED / missing AWB
+  if (
+    !matchedOrder.awb ||
+    /^self\s+fulfilled$/i.test(String(matchedOrder.status || ""))
+  ) {
+    await fetchShopifyFulfillmentForOrder(
+      String(matchedOrder.channel_order_id || ""),
+      matchedOrder,
+    );
+  }
+
+  const orderId = Number(matchedOrder.id);
+  const phone = String(matchedOrder.customer_phone || phoneList[0] || "").trim();
+  const extUserId = String(ticket.external_user_id || validEmail || "").trim();
+  const channel = String(ticket.channel || "email");
+
+  await db
+    .prepare(
+      `UPDATE support_tickets
+       SET order_id = COALESCE(order_id, ?),
+           associated_phone = CASE WHEN COALESCE(associated_phone, '') = '' AND ? <> '' THEN ? ELSE associated_phone END
+       WHERE id = ?`,
+    )
+    .bind(orderId, phone, phone, ticketId)
+    .run()
+    .catch(() => null);
+
+  if (extUserId) {
+    await db
+      .prepare(
+        `INSERT INTO support_customer_links(channel, external_user_id, customer_email, customer_phone, customer_name, linked_order_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, now())
+         ON CONFLICT (channel, external_user_id) DO UPDATE SET
+           linked_order_id = COALESCE(support_customer_links.linked_order_id, EXCLUDED.linked_order_id),
+           customer_phone = CASE WHEN support_customer_links.customer_phone = '' THEN EXCLUDED.customer_phone ELSE support_customer_links.customer_phone END,
+           updated_at = now()`,
+      )
+      .bind(
+        channel,
+        extUserId,
+        String(matchedOrder.customer_email || validEmail || ""),
+        phone,
+        String(ticket.customer_name || ""),
+        orderId,
+      )
+      .run()
+      .catch(() => null);
+  }
+
+  return orderId;
+}
+
+export async function autoLinkTicketsToOrders(limit = 80): Promise<{ linked: number }> {
+  const db = await operationsDb();
+  const rows = await db
+    .prepare(
+      `SELECT id FROM support_tickets
+       WHERE order_id IS NULL
+       ORDER BY updated_at DESC
+       LIMIT ?`,
+    )
+    .bind(Math.min(250, Math.max(1, limit)))
+    .all<{ id: string }>()
+    .catch(() => ({ results: [] as { id: string }[] }));
+
+  let linked = 0;
+  for (const r of rows.results) {
+    const id = await findAndLinkOrderForTicket(String(r.id)).catch(() => null);
+    if (id) linked++;
+  }
+  return { linked };
+}
 
 export async function fetchLiveOrderTrackingInfo(params: {
   awb?: string;
@@ -1784,7 +2223,7 @@ export async function fetchLiveOrderTrackingInfo(params: {
   if (params.orderId) {
     orderRow = await db
       .prepare(
-        "SELECT id, channel_order_id, status, awb, courier, ndr_reason, order_date FROM orders WHERE id = ? LIMIT 1",
+        "SELECT id, channel_order_id, status, awb, courier, ndr_reason, order_date, raw_json FROM orders WHERE id = ? LIMIT 1",
       )
       .bind(params.orderId)
       .first<Record<string, unknown>>()
@@ -1792,28 +2231,51 @@ export async function fetchLiveOrderTrackingInfo(params: {
   } else if (params.awb) {
     orderRow = await db
       .prepare(
-        "SELECT id, channel_order_id, status, awb, courier, ndr_reason, order_date FROM orders WHERE awb = ? LIMIT 1",
+        "SELECT id, channel_order_id, status, awb, courier, ndr_reason, order_date, raw_json FROM orders WHERE awb = ? LIMIT 1",
       )
       .bind(params.awb.trim())
       .first<Record<string, unknown>>()
       .catch(() => null);
   } else if (params.orderCode) {
-    const cleanCode = params.orderCode.replace(/^#/, "").trim().toUpperCase();
-    orderRow = await db
-      .prepare(
-        "SELECT id, channel_order_id, status, awb, courier, ndr_reason, order_date FROM orders WHERE UPPER(REPLACE(channel_order_id, '#', '')) = ? LIMIT 1",
-      )
-      .bind(cleanCode)
-      .first<Record<string, unknown>>()
-      .catch(() => null);
+    for (const variant of expandOrderCodeVariants(params.orderCode)) {
+      orderRow = await db
+        .prepare(
+          "SELECT id, channel_order_id, status, awb, courier, ndr_reason, order_date, raw_json FROM orders WHERE UPPER(REPLACE(channel_order_id, '#', '')) = ? LIMIT 1",
+        )
+        .bind(variant)
+        .first<Record<string, unknown>>()
+        .catch(() => null);
+      if (orderRow) break;
+    }
   }
 
-  const awb = String(params.awb || orderRow?.awb || "").trim();
-  const courier = String(orderRow?.courier || "").trim();
+  let awb = String(params.awb || orderRow?.awb || "").trim();
+  let courier = String(orderRow?.courier || "").trim();
   const orderCode = String(orderRow?.channel_order_id || params.orderCode || "");
-  const fallbackStatus = String(orderRow?.status || "PROCESSING");
+  let fallbackStatus = String(orderRow?.status || "PROCESSING");
   const ndrReason = String(orderRow?.ndr_reason || "");
-  const trackingUrl = buildCourierTrackingUrl(courier, awb);
+  let preferredUrl = extractRawTrackingUrl(orderRow?.raw_json);
+  let shopifyEnriched = false;
+
+  if (
+    orderCode &&
+    (!awb ||
+      /^self\s+fulfilled$/i.test(fallbackStatus) ||
+      (!preferredUrl && /^(?:other|)$/i.test(courier)))
+  ) {
+    const sf = await fetchShopifyFulfillmentForOrder(orderCode, orderRow);
+    if (sf) {
+      shopifyEnriched = true;
+      if (!awb && sf.awb) awb = sf.awb;
+      if ((!courier || /^other$/i.test(courier)) && sf.courier) courier = sf.courier;
+      if (!preferredUrl && sf.trackingUrl) preferredUrl = sf.trackingUrl;
+      if ((/^self\s+fulfilled$/i.test(fallbackStatus) || fallbackStatus === "PROCESSING") && sf.status) {
+        fallbackStatus = sf.status;
+      }
+    }
+  }
+
+  const trackingUrl = buildCourierTrackingUrl(courier, awb, preferredUrl);
 
   if (awb) {
     const srToken = await getShiprocketToken();
@@ -1863,7 +2325,7 @@ export async function fetchLiveOrderTrackingInfo(params: {
               courier: String(trackHead?.courier_name || courier),
               orderCode,
               status: String(trackHead?.current_status || fallbackStatus),
-              trackingUrl: String(td.track_url || trackingUrl),
+              trackingUrl: preferredUrl || String(td.track_url || trackingUrl),
               etd: String(td.etd || trackHead?.edd || ""),
               currentLocation: String(activities[0]?.location || trackHead?.destination || ""),
               ndrReason,
@@ -1873,12 +2335,12 @@ export async function fetchLiveOrderTrackingInfo(params: {
           }
         }
       } catch {
-        // Fall back to local DB order snapshot
+        // Fall back to Shopify / local DB order snapshot
       }
     }
   }
 
-  if (!awb && !orderRow) return null;
+  if (!awb && !orderRow && !shopifyEnriched) return null;
 
   return {
     awb,
@@ -1890,7 +2352,7 @@ export async function fetchLiveOrderTrackingInfo(params: {
     currentLocation: "",
     ndrReason,
     activities: [],
-    source: "local_db",
+    source: shopifyEnriched ? "shopify_live" : "local_db",
   };
 }
 
@@ -2007,7 +2469,10 @@ export async function retrieveStoreContext(params: {
     );
     orderParams.push(resolvedPhone);
   }
-  for (const code of hints.orderCodes) {
+  const lookupOrderCodes = Array.from(
+    new Set(hints.orderCodes.flatMap((code) => expandOrderCodeVariants(code)))
+  ).slice(0, 18);
+  for (const code of lookupOrderCodes) {
     orderClauses.push("UPPER(REPLACE(channel_order_id, '#', '')) = ?");
     orderParams.push(code);
   }
@@ -2065,10 +2530,30 @@ export async function retrieveStoreContext(params: {
     };
   });
 
+  // Self-heal any matched SELF FULFILLED / blank-AWB orders using Shopify fulfillment data (Velocity Shipping, etc.)
+  let shopifyEnrichedCount = 0;
+  for (let idx = 0; idx < orders.length && shopifyEnrichedCount < 2; idx++) {
+    const ord = orders[idx];
+    if (!ord.awb || /^self\s+fulfilled$/i.test(ord.status)) {
+      shopifyEnrichedCount++;
+      const sf = await fetchShopifyFulfillmentForOrder(ord.channelOrderId, rawOrders[idx]);
+      if (sf) {
+        if (!ord.awb && sf.awb) ord.awb = sf.awb;
+        if ((!ord.courier || /^other$/i.test(ord.courier)) && sf.courier) ord.courier = sf.courier;
+        if (/^self\s+fulfilled$/i.test(ord.status) && sf.status) ord.status = sf.status;
+        if (!ord.customerPhone && sf.phone) ord.customerPhone = sf.phone;
+        if (!ord.customerEmail && sf.email) ord.customerEmail = sf.email;
+      }
+    }
+  }
+
   // Check if any requested order codes are missing from local DB, or no orders found yet -> check live Shopify & Shiprocket
-  const existingCodeSet = new Set(
-    orders.map((o) => o.channelOrderId.replace(/^#/, "").trim().toUpperCase()),
-  );
+  const existingCodeSet = new Set<string>();
+  for (const o of orders) {
+    for (const v of expandOrderCodeVariants(o.channelOrderId)) {
+      existingCodeSet.add(v);
+    }
+  }
   const missingOrderCodes = hints.orderCodes.filter((c) => !existingCodeSet.has(c));
 
   if (
