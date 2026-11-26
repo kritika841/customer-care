@@ -786,7 +786,7 @@ export async function syncMetaInboxes(lookbackDays = SYNC_LOOKBACK_DAYS) {
             await sql`
               INSERT INTO support_messages (
                 id, ticket_id, gmail_message_id, message_id, direction, sender, recipients,
-                body, attachments, delivery_status, inbound_auth_verified, created_at
+                body, attachments, delivery_status, created_at
               ) VALUES (
                 ${randomUUID()}, ${ticketId}, ${msgKey}, ${msg.id}, ${direction},
                 ${isOutbound ? String(account.account_name || channel) : customerName},
@@ -794,7 +794,6 @@ export async function syncMetaInboxes(lookbackDays = SYNC_LOOKBACK_DAYS) {
                 ${bodyText},
                 ${sql.json(msgAttachments)},
                 ${isOutbound ? "sent" : "received"},
-                ${!isOutbound},
                 ${createdAt}
               )
             `;
@@ -1528,10 +1527,10 @@ export async function ingestMetaWebhook(payload: {
         await sql`
           INSERT INTO support_messages (
             id, ticket_id, gmail_message_id, message_id, direction, sender, recipients,
-            body, attachments, delivery_status, inbound_auth_verified, created_at
+            body, attachments, delivery_status, created_at
           ) VALUES (
             ${randomUUID()}, ${ticketId}, ${msgKey}, ${mid}, 'inbound',
-            ${customerName}, ${channel}, ${text}, ${sql.json(webhookAttachments)}, 'received', TRUE,
+            ${customerName}, ${channel}, ${text}, ${sql.json(webhookAttachments)}, 'received',
             ${createdAt}
           )
         `;
