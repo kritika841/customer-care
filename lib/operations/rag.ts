@@ -2420,6 +2420,12 @@ export async function retrieveStoreContext(params: {
       const localQueryVec =
         embeddingModel === "satmi-hashed-ngram-768" ? queryEmbedding : getLocalQueryVec();
       vecSim = Math.max(0, cosineSimilarity(localQueryVec, emb) * (embeddingModel === "satmi-hashed-ngram-768" ? 1 : 0.85));
+    } else if (embeddingModel === "satmi-hashed-ngram-768") {
+      // When Gemini/OpenAI embeddings are not configured, score chunks in local 768-dim hashed space cleanly
+      const chunkLocalVec = deterministicLocalEmbedding(
+        `${String(r.document_title || "")}\n${String(r.heading || "")}\n${String(r.content || "")}`,
+      );
+      vecSim = Math.max(0, cosineSimilarity(queryEmbedding, chunkLocalVec));
     }
 
     const ftsRank = Math.min(1, Number(r.fts_rank || 0) * 2.5);

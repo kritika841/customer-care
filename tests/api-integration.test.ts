@@ -514,8 +514,10 @@ test("Layer 3: API, Concurrency, Security & Failure-Injection Integration Suite"
       const targetTicketId = ticketIds[1];
       const origFetch = globalThis.fetch;
       const prevProvider = process.env.AI_PROVIDER;
+      const prevGeminiKey = process.env.GEMINI_API_KEY;
       const prevRetryBase = process.env.AI_PROVIDER_RETRY_BASE_MS;
       process.env.AI_PROVIDER = "gemini";
+      process.env.GEMINI_API_KEY = "test-mock-gemini-key";
       process.env.AI_PROVIDER_RETRY_BASE_MS = "10";
 
       let chatAttempts = 0;
@@ -618,6 +620,8 @@ test("Layer 3: API, Concurrency, Security & Failure-Injection Integration Suite"
         globalThis.fetch = origFetch;
         if (prevProvider === undefined) delete process.env.AI_PROVIDER;
         else process.env.AI_PROVIDER = prevProvider;
+        if (prevGeminiKey === undefined) delete process.env.GEMINI_API_KEY;
+        else process.env.GEMINI_API_KEY = prevGeminiKey;
         if (prevRetryBase === undefined) delete process.env.AI_PROVIDER_RETRY_BASE_MS;
         else process.env.AI_PROVIDER_RETRY_BASE_MS = prevRetryBase;
       }
