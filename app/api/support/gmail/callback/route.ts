@@ -12,7 +12,7 @@ import {
   gmail,
   encrypt,
 } from "../../../../../lib/operations/gmail";
-import { errorResponse, HttpError } from "../../../../../lib/http";
+import { errorResponse, getTrustedAppOrigin, HttpError } from "../../../../../lib/http";
 export const maxDuration=300;
 async function GETHandler(r: Request) {
   try {
@@ -61,7 +61,7 @@ async function GETHandler(r: Request) {
       .bind(mailbox(), encrypt(token.refresh_token), u.id, since)
       .run();
     after(async()=>{try{await syncMailbox();}catch{console.error("Initial Gmail import failed; scheduled retry will follow");}});
-    return Response.redirect(new URL("/?view=support&connected=1", r.url));
+    return Response.redirect(new URL("/?view=settings&connected=1", getTrustedAppOrigin(r)));
   } catch (e) {
     return errorResponse(e);
   }
