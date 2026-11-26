@@ -12,6 +12,7 @@ import { GET as supportGET, POST as supportPOST } from "../app/api/support/route
 import { GET as streamGET } from "../app/api/support/stream/route";
 import { GET as logsGET } from "../app/api/logs/route";
 import { GET as healthSyncGET } from "../app/api/health/sync/route";
+import { POST as signInPOST } from "../app/api/auth/sign-in/route";
 import {
   GET as metaWebhookGET,
   POST as metaWebhookPOST,
@@ -624,6 +625,46 @@ test("Layer 3: API, Concurrency, Security & Failure-Injection Integration Suite"
         else process.env.GEMINI_API_KEY = prevGeminiKey;
         if (prevRetryBase === undefined) delete process.env.AI_PROVIDER_RETRY_BASE_MS;
         else process.env.AI_PROVIDER_RETRY_BASE_MS = prevRetryBase;
+      }
+    });
+
+    await t.test("6. Per-account login lockout isolates failing account without blocking sibling accounts on same IP", async () => {
+      const testIp = `203.0.113.${Math.floor(Math.random() * 200) + 10}`;
+      const makeSignInReq = (email: string, password: string) =>
+        new Request(`${ORIGIN}/api/auth/sign-in`, {
+          method: "POST",
+          headers: {
+            host: "127.0.0.1:5010",
+            origin: ORIGIN,
+            "content-type": "application/json",
+            "x-forwarded-for": testIp,
+          },
+          body: JSON.stringify({ email, password }),
+        });
+
+      try {
+        for (let i = 0; i < 5; i++) {
+          const failRes = await signInPOST(makeSignInReq(adminUser.email, "WrongPass!999"));
+          assert.equal(failRes.status, 401);
+        }
+
+        // 6th attempt on locked account is blocked (429)
+        const lockedRes = await signInPOST(makeSignInReq(adminUser.email, "TestPass123!"));
+        assert.equal(lockedRes.status, 429);
+
+        // Sibling account on the EXACT same IP signs in cleanly (200)
+        const siblingRes = await signInPOST(makeSignInReq(managerUser.email, "TestPass123!"));
+        assert.equal(siblingRes.status, 200);
+        const siblingJson = (await siblingRes.json()) as { ok: boolean };
+        assert.equal(siblingJson.ok, true);
+      } finally {
+        await withRequestDatabase(async () => {
+          const db = await operationsDb();
+          await db
+            .prepare("DELETE FROM auth_login_attempts WHERE key LIKE ? OR key LIKE ?")
+            .bind(`%${testIp}%`, `%${adminUser.email}%`)
+            .run();
+        });
       }
     });
   } finally {

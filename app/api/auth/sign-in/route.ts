@@ -58,10 +58,24 @@ export async function POST(request: Request) {
 
     const normalizedEmail = email.toLowerCase();
     const clientIp = clientIpFromRequest(request);
-    const rateKeys = [`ip:${clientIp}`, `acct:${clientIp}:${normalizedEmail}`];
+    // Lock strictly per-account at 5 attempts (12 cross-IP), reserving IP-wide blocks for >= 30 failed sprays
+    const checkKeys = [
+      `acct:${clientIp}:${normalizedEmail}`,
+      `acct_email:${normalizedEmail}`,
+      `ip:${clientIp}`,
+    ];
+    const failureRules = [
+      { key: `acct:${clientIp}:${normalizedEmail}`, maxAttempts: 5 },
+      { key: `acct_email:${normalizedEmail}`, maxAttempts: 12 },
+      { key: `ip:${clientIp}`, maxAttempts: 30 },
+    ];
+    const clearKeys = [
+      `acct:${clientIp}:${normalizedEmail}`,
+      `acct_email:${normalizedEmail}`,
+    ];
 
     const result = await withRequestDatabase(async () => {
-      const lockout = await checkLoginLockout(rateKeys);
+      const lockout = await checkLoginLockout(checkKeys);
       if (lockout.blocked) {
         return {
           locked: true as const,
@@ -71,7 +85,7 @@ export async function POST(request: Request) {
 
       const auth = await authenticateUser(normalizedEmail, password);
       if (!auth.user || auth.error) {
-        await recordLoginFailure(rateKeys, 5, 15 * 60_000, 15 * 60_000);
+        await recordLoginFailure(failureRules, 5, 15 * 60_000, 15 * 60_000);
         return {
           locked: false as const,
           user: null,
@@ -79,7 +93,7 @@ export async function POST(request: Request) {
         };
       }
 
-      await clearLoginFailures(rateKeys);
+      await clearLoginFailures(clearKeys);
       const token = await issuePersistedSession(auth.user);
       return {
         locked: false as const,

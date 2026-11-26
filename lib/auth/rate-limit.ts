@@ -46,12 +46,14 @@ export async function checkLoginLockout(keys: string[]): Promise<{
   return { blocked: maxRetry > 0, retryAfterSeconds: maxRetry };
 }
 
+export type LoginFailureRule = string | { key: string; maxAttempts?: number };
+
 /**
  * Records a failed login attempt and locks out after `maxAttempts` within `windowMs`.
  */
 export async function recordLoginFailure(
-  keys: string[],
-  maxAttempts = 5,
+  rules: LoginFailureRule[],
+  defaultMaxAttempts = 5,
   windowMs = 15 * 60_000,
   lockoutMs = 15 * 60_000,
 ): Promise<void> {
@@ -59,7 +61,12 @@ export async function recordLoginFailure(
   await ensureSchema(runtime.DB);
   const now = Date.now();
 
-  for (const key of keys) {
+  for (const rule of rules) {
+    const key = typeof rule === "string" ? rule : rule.key;
+    const maxAttempts =
+      typeof rule === "string"
+        ? defaultMaxAttempts
+        : Math.max(1, Number(rule.maxAttempts ?? defaultMaxAttempts));
     const existing = await runtime.DB.prepare(
       "SELECT attempts, first_attempt_at FROM auth_login_attempts WHERE key = ?",
     )
