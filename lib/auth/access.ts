@@ -57,7 +57,27 @@ function dashboardUser(user: {
   };
 }
 
-export async function currentDashboardUser(): Promise<DashboardUser | null> {
+function parseCookieHeader(cookieHeader: string | null | undefined, name: string): string {
+  if (!cookieHeader) return "";
+  for (const part of cookieHeader.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    const k = part.slice(0, eq).trim();
+    if (k === name) {
+      return decodeURIComponent(part.slice(eq + 1).trim());
+    }
+  }
+  return "";
+}
+
+export async function currentDashboardUser(request?: Request): Promise<DashboardUser | null> {
+  if (request) {
+    const rawCookie = parseCookieHeader(request.headers.get("cookie"), SESSION_COOKIE_NAME);
+    if (rawCookie) {
+      const localUser = await verifyLiveSession(rawCookie);
+      if (localUser) return localUser;
+    }
+  }
   try {
     const { cookies } = await import("next/headers");
     const cookieStore = await cookies();
@@ -109,8 +129,8 @@ export async function requirePageAdmin(): Promise<DashboardUser> {
   return user;
 }
 
-export async function requireApiUser() {
-  const user = await currentDashboardUser();
+export async function requireApiUser(request?: Request) {
+  const user = await currentDashboardUser(request);
   if (!user) {
     return {
       user: null,
@@ -120,8 +140,8 @@ export async function requireApiUser() {
   return { user, response: null } as const;
 }
 
-export async function requireApiAdmin() {
-  const result = await requireApiUser();
+export async function requireApiAdmin(request?: Request) {
+  const result = await requireApiUser(request);
   if (result.response) return result;
   if (!isAdmin(result.user)) {
     return {

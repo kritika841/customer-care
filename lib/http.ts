@@ -74,6 +74,11 @@ export function errorResponse(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
   if (error instanceof HttpError)
     return Response.json({ error: message }, { status: error.status });
+  if (error instanceof SyntaxError)
+    return Response.json(
+      { error: "Invalid or malformed JSON request body.", code: "INVALID_JSON" },
+      { status: 400 },
+    );
   const code = (error as {code?:string})?.code;
   if (['CONNECTION_CLOSED','CONNECTION_ENDED','ECONNRESET','ECONNREFUSED','ENOTFOUND','EAI_AGAIN','CONNECT_TIMEOUT'].includes(code || '')) return Response.json({error:'The data service is temporarily unavailable. Please retry.',code:'SERVICE_UNAVAILABLE'},{status:503});
   if (code === '55P03') return Response.json({error:'The data service is busy updating records. Please retry shortly.',code:'DATABASE_BUSY'},{status:503});

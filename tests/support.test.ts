@@ -39,10 +39,20 @@ const {
   estimateTokenCount,
   deterministicLocalEmbedding,
   cosineSimilarity,
+  generateStructuredJson,
+  embedText,
 } = await import("../lib/operations/ai-provider");
-const { chunkKnowledgeDocument, scrubCustomerPii, buildCourierTrackingUrl } = await import(
-  "../lib/operations/rag"
-);
+const {
+  chunkKnowledgeDocument,
+  scrubCustomerPii,
+  buildCourierTrackingUrl,
+  cleanScrapedStoreText,
+  extractReadableMainHtml,
+  expandHindiAndHinglishQuery,
+  buildFtsOrQuery,
+  computeKeywordLexicalScore,
+  isSparseHashedVector,
+} = await import("../lib/operations/rag");
 const {
   extractPinnedFactsFromMessages,
   buildCompactedThreadContext,
@@ -52,6 +62,8 @@ const {
   rephraseAdminClarification,
   sanitizeNomenclatureLabel,
   isOrderSpecificQueryOrCorrection,
+  cleanRagTextForCustomerReply,
+  stripRetrievalBoilerplate,
 } = await import("../lib/operations/ai-agent");
 
 test("AES-256-GCM token encryption and MIME header sanitization", async () => {
@@ -809,4 +821,391 @@ test("AI token cost estimator and spend formatting helpers", () => {
   assert.equal(formatCostInr(0), "₹0.00");
   assert.equal(formatCostInr(0.01, 85), "₹0.85");
 });
+
+test("Automated support noise filter blocks calendar invites, Microsoft Clarity, attendance reminders, and internal Shopify notifications while preserving customer Contact Us emails", () => {
+  // 1. Google Calendar invites & updated invitations
+  assert.equal(
+    isAutomatedSupportNoise(
+      new Map(),
+      "garima.arora@gokwik.co",
+      "Invitation: Satmi<>Checkout @ Thu Nov 5, 2026 2pm - 2:30pm (GMT+5:30) (kritika@satmi.in)"
+    ),
+    true
+  );
+  assert.equal(
+    isAutomatedSupportNoise(
+      new Map(),
+      "garima.arora@gokwik.co",
+      "Updated invitation: Satmi<>Checkout @ Thu Nov 5, 2026 2:30pm - 3pm (GMT+5:30) (kritika@satmi.in)"
+    ),
+    true
+  );
+  assert.equal(
+    isAutomatedSupportNoise(
+      new Map([["content-type", "text/calendar; charset=UTF-8; method=REQUEST"]]),
+      "partner@company.com",
+      "Sync call"
+    ),
+    true
+  );
+
+  // 2. Microsoft Clarity & analytics setup alerts
+  assert.equal(
+    isAutomatedSupportNoise(
+      new Map(),
+      "maccount@microsoft.com",
+      "Finish setting up your Clarity project: Satmi"
+    ),
+    true
+  );
+
+  // 3. Attendance check-in / check-out reminders
+  assert.equal(
+    isAutomatedSupportNoise(
+      new Map(),
+      "hr@company.in",
+      "Attendance Reminder: Please complete your check-in / check-out"
+    ),
+    true
+  );
+  assert.equal(
+    isAutomatedSupportNoise(
+      new Map(),
+      "notify@keka.com",
+      "Missed punch-out alert for today"
+    ),
+    true
+  );
+
+  // 4. Internal Shopify notifications without external customer Reply-To
+  assert.equal(
+    isAutomatedSupportNoise(
+      new Map(),
+      "mailer@shopify.com",
+      "Export of your orders"
+    ),
+    true
+  );
+  assert.equal(
+    isAutomatedSupportNoise(
+      new Map(),
+      "mailer@shopify.com",
+      "Settings have been changed for luro-bvqp7dp1.myshopify.com"
+    ),
+    true
+  );
+
+  // 5. Shopify Contact Us form with genuine customer Reply-To is preserved
+  const contactHeaders = new Map([
+    ["from", "Shopify Contact <mailer@shopify.com>"],
+    ["reply-to", "Riya <riya@customer.in>"],
+  ]);
+  assert.equal(
+    isAutomatedSupportNoise(
+      contactHeaders,
+      "mailer@shopify.com",
+      "New customer message on Nov 26, 2026"
+    ),
+    false
+  );
+  assert.equal(
+    extractReplyToEmail(contactHeaders, "mailer@shopify.com", "New customer message"),
+    "riya@customer.in"
+  );
+});
+
+test("Scraped HTML & template cleaner strips storefront UI chrome and resolves {{customer_name}} placeholders", () => {
+  const pollutedHtml = `
+    <html>
+      <head><title>Buy 2 Karungali</title><script>console.log("track")</script></head>
+      <body>
+        <header>Nav Menu</header>
+        <main>
+          <h1>Buy 2 Karungali at ₹999</h1>
+          <p>Original 108-Beads Ebony Wood Mala with Govt. Lab Certification.</p>
+          <button>ADD TO BOX</button>
+          <div>−</div>
+          <div>1 added</div>
+          <div>+</div>
+          <button>BUY IT NOW</button>
+          <span>✕</span><span>❮</span><span>❯</span>
+          <form>
+            <label>First Name</label>
+            <label>Phone Number</label>
+            <button>Send Message</button>
+          </form>
+        </main>
+        <footer>Footer links</footer>
+      </body>
+    </html>
+  `;
+  const readable = extractReadableMainHtml(pollutedHtml);
+  assert.match(readable, /Original 108-Beads Ebony Wood Mala/);
+  assert.doesNotMatch(readable, /ADD TO BOX|BUY IT NOW|Send Message|1 added|[✕❮❯]/i);
+
+  const rawDraft =
+    "Source: https://satmi.in/pages/buy-2-karungali-at-999\nHi {{customer_name}},\nYour order {{order_id}} is confirmed. {{unknown_tag}}\nADD TO BOX\nBUY IT NOW\n✕ ❮ ❯";
+  const cleanedDraft = cleanRagTextForCustomerReply(rawDraft, "Ananya", "#S10729974");
+  assert.match(cleanedDraft, /Hi Ananya/);
+  assert.match(cleanedDraft, /#S10729974/);
+  assert.doesNotMatch(cleanedDraft, /\{\{/);
+  assert.doesNotMatch(cleanedDraft, /ADD TO BOX|BUY IT NOW|Source:|[✕❮❯]/i);
+
+  const cleanedStoreText = cleanScrapedStoreText(rawDraft);
+  assert.doesNotMatch(cleanedStoreText, /\{\{|ADD TO BOX|BUY IT NOW|Source:|[✕❮❯]/i);
+
+  const strippedBoilerplate = stripRetrievalBoilerplate(
+    "Facebook created this chat because user clicked ad.\nWhere is my Karungali mala order?\nSent from my iPhone"
+  );
+  assert.match(strippedBoilerplate, /Where is my Karungali mala order/i);
+  assert.doesNotMatch(strippedBoilerplate, /Sent from my iPhone/i);
+});
+
+test("Hindi & Hinglish query synonym expansion and lexical scoring bridge Devanagari/Roman queries to English KB", () => {
+  const hindiOrder = expandHindiAndHinglishQuery("मेरा ऑर्डर कब तक मिल जाएगा");
+  assert.equal(hindiOrder.hasHindiOrHinglish, true);
+  assert.ok(hindiOrder.expansionTerms.includes("order"));
+  assert.ok(hindiOrder.expansionTerms.includes("delivery"));
+  assert.ok(hindiOrder.expansionTerms.includes("dispatch"));
+
+  const hinglishOrder = expandHindiAndHinglishQuery("ye product magya tha vo aaya nhi");
+  assert.equal(hinglishOrder.hasHindiOrHinglish, true);
+  assert.ok(hinglishOrder.expansionTerms.includes("delivery"));
+  assert.ok(hinglishOrder.expansionTerms.includes("tracking"));
+
+  const hinglishProduct = expandHindiAndHinglishQuery("Total sticks kitni hai 699 mai");
+  assert.equal(hinglishProduct.hasHindiOrHinglish, true);
+  assert.ok(hinglishProduct.expansionTerms.includes("incense"));
+  assert.ok(hinglishProduct.expansionTerms.includes("sticks"));
+
+  const ftsOr = buildFtsOrQuery("मेरा ऑर्डर कब तक मिल जाएगा");
+  assert.match(ftsOr, /\border\b/);
+  assert.match(ftsOr, /\bdelivery\b/);
+  assert.match(ftsOr, /\|/);
+
+  const shippingChunkHeading = "Satmi Shipping, Dispatch & Delivery Timelines Policy";
+  const shippingChunkBody =
+    "All ready-to-ship Satmi orders are dispatched within 24 to 48 working hours. Standard delivery across India takes 4 to 7 working days.";
+
+  const hindiLexScore = computeKeywordLexicalScore(
+    "मेरा ऑर्डर कब तक मिल जाएगा",
+    shippingChunkHeading,
+    shippingChunkBody
+  );
+  assert.ok(
+    hindiLexScore >= 0.45,
+    `Expected Hindi query lexical score >= 0.45 against shipping policy, got ${hindiLexScore}`
+  );
+
+  const hinglishLexScore = computeKeywordLexicalScore(
+    "ye product magya tha vo aaya nhi",
+    shippingChunkHeading,
+    shippingChunkBody
+  );
+  assert.ok(
+    hinglishLexScore >= 0.45,
+    `Expected Hinglish query lexical score >= 0.45 against shipping policy, got ${hinglishLexScore}`
+  );
+});
+
+test("Output draft safety validator blocks template placeholders, UI chrome, and unverified order PII leakage", () => {
+  const unverifiedStoreContext = {
+    query: "Where is order #S10729974?",
+    extractedHints: { orderCodes: ["S10729974"], phones: [] },
+    requestedOrderCodes: ["S10729974"],
+    orders: [
+      {
+        id: 1,
+        channelOrderId: "#S10729974",
+        status: "IN TRANSIT",
+        awb: "DL9988776655",
+        courier: "Delhivery",
+        total: 1499,
+        isVipHighValue: false,
+        paymentMethod: "Prepaid",
+        orderDate: "2026-11-20",
+        ndrReason: "",
+        ndrAttempts: 0,
+        confirmationStatus: "confirmed",
+        customerName: "Ananya Sharma",
+        customerEmail: "ananya.secret@gmail.com",
+        customerPhone: "9876543210",
+        customerCity: "Jaipur",
+        customerState: "RJ",
+        itemsSummary: "1x Karungali Malai",
+      },
+    ],
+    customerVerified: false,
+    verificationReason: "Social DM customer must confirm registered 10-digit phone or email alongside Order ID",
+    associatedCustomerPhone: "",
+    phoneMismatchDetected: false,
+    phoneMismatchReason: "",
+    newlyVerifiedPhoneToAssociate: "",
+    customer360: computeCustomer360([], 0),
+    hasVipOrder: false,
+    highestOrderTotal: 1499,
+    ragChunks: [],
+    topRrfScore: 0,
+    topVectorSimilarity: 0,
+    topLexicalScore: 0,
+    hasStrongKnowledgeMatch: true,
+    embeddingModel: "gemini-embedding-001",
+    embeddingUsage: {
+      inputTokens: 10,
+      outputTokens: 0,
+      totalTokens: 10,
+      estimatedCostUsd: 0,
+      isEstimated: true,
+    },
+  };
+
+  // Blocks {{customer_name}} placeholder
+  assert.equal(
+    validateAiDraftSafety({
+      draft: "Hi {{customer_name}}, your order is on the way!",
+      storeContext: unverifiedStoreContext,
+      latestCustomerText: "Where is order #S10729974?",
+    }).safe,
+    false
+  );
+
+  // Blocks ADD TO BOX storefront chrome
+  assert.equal(
+    validateAiDraftSafety({
+      draft: "Karungali Mala is available at ₹699. ADD TO BOX",
+      storeContext: unverifiedStoreContext,
+      latestCustomerText: "Price of Karungali Mala?",
+    }).safe,
+    false
+  );
+
+  // Blocks AWB leak when customerVerified === false
+  assert.equal(
+    validateAiDraftSafety({
+      draft: "Your order #S10729974 is shipped with AWB DL9988776655.",
+      storeContext: unverifiedStoreContext,
+      latestCustomerText: "Where is order #S10729974?",
+    }).safe,
+    false
+  );
+
+  // Blocks phone leak when customerVerified === false
+  assert.equal(
+    validateAiDraftSafety({
+      draft: "Your order is linked to phone 9876543210.",
+      storeContext: unverifiedStoreContext,
+      latestCustomerText: "Where is order #S10729974?",
+    }).safe,
+    false
+  );
+
+  // Allows safe verification prompt when customerVerified === false
+  assert.equal(
+    validateAiDraftSafety({
+      draft: "Hi there, please confirm your 10-digit registered phone number or email address for order #S10729974.",
+      storeContext: unverifiedStoreContext,
+      latestCustomerText: "Where is order #S10729974?",
+    }).safe,
+    true
+  );
+
+  // Selective decline learning blocks order-specific refund status queries
+  assert.equal(
+    isOrderSpecificQueryOrCorrection({
+      customerQuery: "Where is my refund?",
+      declineReason: "Refund already processed",
+      correctedReply: "Your refund of ₹699 has been processed with UTR 123456789.",
+    }).isOrderSpecific,
+    true
+  );
+});
+
+test("Sparse hashed vector detector and Gemini provider retry/backoff on 429 & 500 bursts", async () => {
+  const sparseVec = deterministicLocalEmbedding("Karungali Malai 108 beads");
+  assert.equal(isSparseHashedVector(sparseVec), true);
+
+  const denseVec = Array.from({ length: EMBEDDING_DIM }, (_, i) => Math.sin(i + 1) * 0.05);
+  assert.equal(isSparseHashedVector(denseVec), false);
+
+  // Mock fetch to simulate 429 then 500 then 200 recovery
+  const origFetch = globalThis.fetch;
+  const prevKey = process.env.GEMINI_API_KEY;
+  const prevRetryBase = process.env.AI_PROVIDER_RETRY_BASE_MS;
+  let callCount = 0;
+  let capturedBody = "";
+  try {
+    process.env.GEMINI_API_KEY = "test-mock-gemini-key";
+    process.env.AI_PROVIDER_RETRY_BASE_MS = "10";
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      callCount++;
+      capturedBody = String(init?.body || "");
+      if (callCount === 1) {
+        return new Response('{"error":{"code":429,"message":"Rate limit"}}', { status: 429 });
+      }
+      if (callCount === 2) {
+        return new Response('{"error":{"code":503,"message":"Overloaded"}}', { status: 503 });
+      }
+      return new Response(
+        JSON.stringify({
+          candidates: [{ content: { parts: [{ text: '{"ok":true,"status":"recovered"}' }] } }],
+          usageMetadata: { promptTokenCount: 25, candidatesTokenCount: 8, totalTokenCount: 33 },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }) as typeof fetch;
+
+    const res = await generateStructuredJson<{ ok: boolean; status: string }>({
+      systemInstruction: "Return JSON",
+      userPrompt: "Test retry",
+      fallback: () => ({ ok: false, status: "fallback" }),
+    });
+
+    assert.equal(callCount, 3);
+    assert.equal(res.provider, "gemini");
+    assert.equal(res.data.ok, true);
+    assert.equal(res.data.status, "recovered");
+    assert.match(capturedBody, /"thinkingBudget":0/);
+
+    // Now simulate complete 500 outage across primary + fallback models -> clean fallback to local_heuristic
+    let failCalls = 0;
+    globalThis.fetch = (async () => {
+      failCalls++;
+      return new Response('{"error":{"code":500,"message":"Internal error"}}', { status: 500 });
+    }) as typeof fetch;
+
+    const fallbackRes = await generateStructuredJson<{ ok: boolean; status: string }>({
+      systemInstruction: "Return JSON",
+      userPrompt: "Test full outage",
+      fallback: () => ({ ok: true, status: "heuristic_fallback" }),
+    });
+    assert.ok(failCalls >= 3);
+    assert.equal(fallbackRes.provider, "local_heuristic");
+    assert.equal(fallbackRes.data.status, "heuristic_fallback");
+
+    // Also verify embedText retry on 429 -> 200
+    let embedCalls = 0;
+    globalThis.fetch = (async () => {
+      embedCalls++;
+      if (embedCalls === 1) {
+        return new Response('{"error":{"code":429}}', { status: 429 });
+      }
+      return new Response(
+        JSON.stringify({ embedding: { values: denseVec } }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }) as typeof fetch;
+
+    const embRes = await embedText("Karungali Malai", "RETRIEVAL_QUERY");
+    assert.equal(embedCalls, 2);
+    assert.equal(embRes.model, "gemini-embedding-001");
+    assert.equal(embRes.embedding.length, EMBEDDING_DIM);
+  } finally {
+    globalThis.fetch = origFetch;
+    if (prevKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = prevKey;
+    if (prevRetryBase === undefined) delete process.env.AI_PROVIDER_RETRY_BASE_MS;
+    else process.env.AI_PROVIDER_RETRY_BASE_MS = prevRetryBase;
+  }
+});
+
 

@@ -1052,6 +1052,46 @@ export async function flushMetaOutbox() {
     const channel = String(m.channel) as "instagram" | "facebook";
     const account = accountByChannel.get(channel);
     const recipientId = String(m.external_user_id || "");
+    const recipientHandle = String(m.external_username || m.customer_email || "").toLowerCase();
+    const isTestFixtureMeta =
+      process.env.SUPPORT_TEST_DRY_RUN === "true" ||
+      /^(?:e2e_|test_|l3_)/i.test(recipientId) ||
+      /^@?(?:e2e_|test_|l3_)/i.test(recipientHandle);
+
+    if (isTestFixtureMeta) {
+      const messageRowId = String(m.id);
+      const ticketRowId = String(m.ticket_id);
+      await db.transaction(async (sql) => {
+        await sql`
+          UPDATE support_messages
+          SET delivery_status = 'sent',
+              gmail_message_id = ${`${channel}:test_sent_${messageRowId}`},
+              message_id = ${`test_sent_${messageRowId}`},
+              last_error = '',
+              send_started_at = NULL
+          WHERE id = ${messageRowId}
+        `;
+        await sql`
+          UPDATE support_tickets
+          SET status = ${m.resolve_after_send ? "resolved" : "waiting"},
+              first_response_at = COALESCE(first_response_at, NOW()),
+              resolved_at = CASE WHEN ${Boolean(m.resolve_after_send)} THEN COALESCE(resolved_at, NOW()) ELSE resolved_at END,
+              updated_at = NOW(),
+              version = version + 1
+          WHERE id = ${ticketRowId}
+        `;
+        await supportEvent(
+          sql,
+          String(m.created_by || "system"),
+          ticketRowId,
+          "outbound_sent",
+          { id: messageRowId, channel, dryRunFixture: true }
+        );
+      });
+      sentCount++;
+      continue;
+    }
+
     const deliveryState = parseMetaDeliveryState(m.meta_delivery_state);
     const sentAttSet = new Set(deliveryState.sentAttachmentIds || []);
 

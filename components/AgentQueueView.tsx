@@ -140,7 +140,19 @@ export default function AgentQueueView({
     );
   }
 
-  const ticket = selectedTicket?.id === activeId ? selectedTicket : currentSummary;
+  const ticket =
+    selectedTicket && selectedTicket.id === activeId
+      ? {
+          ...currentSummary,
+          ...selectedTicket,
+          ai_question_for_admin:
+            selectedTicket.ai_question_for_admin ?? currentSummary?.ai_question_for_admin,
+          ai_action_category:
+            selectedTicket.ai_action_category ?? currentSummary?.ai_action_category,
+          ai_reply_body:
+            selectedTicket.ai_reply_body ?? currentSummary?.ai_reply_body,
+        }
+      : currentSummary;
   if (!ticket) return null;
   const ch = getChannelBadge(ticket.channel);
   const primaryOrder = orders[0];

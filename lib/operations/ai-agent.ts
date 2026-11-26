@@ -152,7 +152,7 @@ export async function recordAiTokenUsage(params: {
       .bind(
         id,
         params.ticketId || null,
-        params.messageId || null,
+        params.messageId || "",
         params.operationType,
         String(params.provider || "unknown"),
         String(params.model || "unknown"),
@@ -830,8 +830,52 @@ function sanitizePromptData(raw: string): string {
 }
 
 /**
+ * Strips email/thread boilerplate, signatures, and Meta system chrome before semantic embedding
+ * so long thread noise never dilutes the customer's actual question.
+ */
+export function stripRetrievalBoilerplate(raw: string): string {
+  return visibleEmailBody(String(raw || ""))
+    .replace(META_SYSTEM_NOTICE_RE, " ")
+    .replace(/replied to a post\.\s*See post\([^\n)]*\)/gi, " ")
+    .replace(/^(?:sent from my iphone|sent from my android|get outlook for \w+|confidentiality notice:[\s\S]*)$/gim, " ")
+    .replace(/https?:\/\/[^\s)]+/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Resolves {{customer_name}} / {{order_id}} template variables, strips any remaining
+ * {{...}} placeholders, and removes scraped storefront DOM/UI chrome so raw templates
+ * or button labels can never leak into a customer reply draft.
+ */
+export function cleanRagTextForCustomerReply(
+  raw: string,
+  customerFirstName = "there",
+  orderCode = "",
+): string {
+  const safeName = (customerFirstName || "there").trim().replace(/^@/, "") || "there";
+  const safeOrder = (orderCode || "your order").trim();
+
+  return String(raw || "")
+    .replace(/\{\{\s*(?:customer_name|first_name|name)\s*\}\}/gi, safeName)
+    .replace(/\{\{\s*(?:order_id|order_number|order_code)\s*\}\}/gi, safeOrder)
+    .replace(/\{\{[^{}\n]*\}\}/g, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/^Source:\s*https?:\/\/\S+\s*$/gim, "")
+    .replace(/^\s*(?:ADD TO BOX|BUY IT NOW|TRACK ORDER|Send Message|1 added|AS SEEN IN|As Seen On)\s*$/gim, "")
+    .replace(/\b(?:ADD TO BOX|BUY IT NOW)\b/gi, "")
+    .replace(/[✕❮❯]/g, "")
+    .replace(/^\s*[−+-]\s*$/gm, "")
+    .replace(/^\s*(?:First Name|Last Name|Phone Number|Message)\s*$/gim, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
  * Validates AI-generated customer replies against retrieved store context to prevent
- * hallucinated links, unauthorized discounts, or ungrounded PII/order numbers.
+ * hallucinated links, unauthorized discounts, template placeholder leaks, UI chrome leaks,
+ * or ungrounded PII/order numbers.
  */
 export function validateAiDraftSafety(params: {
   draft: string;
@@ -840,6 +884,22 @@ export function validateAiDraftSafety(params: {
 }): { safe: boolean; reason: string } {
   const draft = String(params.draft || "").trim();
   if (!draft) return { safe: true, reason: "" };
+
+  // 0a. Block unresolved template {{...}} placeholders
+  if (/\{\{[^{}\n]+\}\}/.test(draft)) {
+    return {
+      safe: false,
+      reason: "AI draft contains unresolved template {{placeholder}}",
+    };
+  }
+
+  // 0b. Block raw storefront DOM/UI chrome leakage
+  if (/\b(?:ADD TO BOX|BUY IT NOW)\b|[✕❮❯]/i.test(draft)) {
+    return {
+      safe: false,
+      reason: "AI draft contains raw storefront UI chrome (ADD TO BOX / BUY IT NOW)",
+    };
+  }
 
   const ragCorpus = params.storeContext.ragChunks
     .map((c) => `${c.heading}\n${c.content}`)
@@ -876,12 +936,47 @@ export function validateAiDraftSafety(params: {
     }
   }
 
-  // 3. Block ungrounded order IDs (must belong to verified orders or customer query)
-  const verifiedOrderCodes = new Set(
-    (params.storeContext.customerVerified !== false ? params.storeContext.orders : []).map((o) =>
-      o.channelOrderId.replace(/^#/, "").toUpperCase(),
-    ),
-  );
+  // 3. Block unverified order PII leakage when customerVerified === false or phoneMismatchDetected
+  const isUnverified =
+    params.storeContext.customerVerified === false ||
+    params.storeContext.phoneMismatchDetected === true;
+  if (isUnverified && params.storeContext.orders.length > 0) {
+    const customerLower = params.latestCustomerText.toLowerCase();
+    for (const ord of params.storeContext.orders) {
+      const awb = String(ord.awb || "").trim();
+      if (awb.length >= 6 && draft.toLowerCase().includes(awb.toLowerCase()) && !customerLower.includes(awb.toLowerCase())) {
+        return {
+          safe: false,
+          reason: `AI draft leaked AWB (${awb}) for unverified order`,
+        };
+      }
+      const orderPhone = String(ord.customerPhone || "").replace(/\D/g, "").slice(-10);
+      if (orderPhone.length === 10 && draft.includes(orderPhone) && !params.latestCustomerText.includes(orderPhone)) {
+        return {
+          safe: false,
+          reason: "AI draft leaked registered phone number for unverified order",
+        };
+      }
+      const orderEmail = String(ord.customerEmail || "").trim().toLowerCase();
+      if (orderEmail.includes("@") && draft.toLowerCase().includes(orderEmail) && !customerLower.includes(orderEmail)) {
+        return {
+          safe: false,
+          reason: "AI draft leaked registered email for unverified order",
+        };
+      }
+    }
+  }
+
+  // 4. Block ungrounded order IDs (must belong to verified orders, verified AWBs, or customer query)
+  const verifiedOrderCodes = new Set<string>();
+  if (params.storeContext.customerVerified !== false && !params.storeContext.phoneMismatchDetected) {
+    for (const o of params.storeContext.orders) {
+      const code = o.channelOrderId.replace(/^#/, "").trim().toUpperCase();
+      if (code) verifiedOrderCodes.add(code);
+      const awb = String(o.awb || "").trim().toUpperCase();
+      if (awb) verifiedOrderCodes.add(awb);
+    }
+  }
   const customerOrderCodes = new Set(
     extractOrderOrPhoneHints(params.latestCustomerText).orderCodes.map((c) => c.toUpperCase()),
   );
@@ -946,13 +1041,16 @@ export function detectMandatoryHumanEscalation(params: {
     };
   }
 
-  // 1. Callback Request (English + Hinglish)
+  // 1. Callback Request (English + Hinglish + Hindi Devanagari)
   if (
     enabled.has("arrange_callback") &&
-    (/\b(call\s*back|callback|call\s+me|phone\s+call|speak\s+to\s+(?:an?\s+)?(?:agent|executive|manager|someone)|talk\s+on\s+(?:phone|call)|arrange\s+a\s+call)\b/i.test(
+    (/\b(call\s*back|callback|call\s+me|phone\s+call|speak\s+to\s+(?:an?\s+)?(?:agent|executive|manager|someone|representative)|talk\s+on\s+(?:phone|call)|talk\s+to\s+(?:an?\s+)?(?:agent|executive|manager)|arrange\s+a\s+call)\b/i.test(
       combined
     ) ||
-      /\b(call\s+kar(?:o|na|iye|do)|baat\s+karn[ai]\s+hai|phone\s+kar(?:o|na|iye|do)|call\s+pe\s+baat)\b/i.test(
+      /\b(call\s+k(?:ar|r)(?:o|na|iye|do|lijiye|lo)?|baat\s+karn[ai]\s+hai|baat\s+karwa(?:o|iye|do)|phone\s+k(?:ar|r)(?:o|na|iye|do|lo)|call\s+pe\s+baat)\b/i.test(
+        combined
+      ) ||
+      /(?:कॉल\s*(?:करो|करिए|करना|बैक|कीजिए)|(?:फोन|फ़ोन)\s*(?:करो|करिए|करना)|बात\s*करनी\s*है)/.test(
         combined
       ))
   ) {
@@ -966,13 +1064,16 @@ export function detectMandatoryHumanEscalation(params: {
     };
   }
 
-  // 2. Angry / Abusive / Legal Threat Sentiment (English + Hinglish)
+  // 2. Angry / Abusive / Legal Threat Sentiment (English + Hinglish + Hindi Devanagari)
   if (
     enabled.has("angry_or_abusive_sentiment") &&
-    (/\b(consumer\s+court|legal\s+action|fir\b|cyber\s+crime|fraud|scam|scammers|cheated|pathetic|worst\s+brand|worst\s+service|useless\s+support|disgusting|stealing\s+money)\b/i.test(
+    (/\b(consumer\s+court|legal\s+action|fir\b|cyber\s+crime|fraud|frod|scam|scammers|cheated|cheating|pathetic|worst\s+brand|worst\s+service|useless\s+support|disgusting|stealing\s+money|horrible\s+service)\b/i.test(
       combined
     ) ||
-      /\b(dhokh[ae]|bakwas|ghatiya|chor|lutera|police\s+complaint|paise\s+khaa)\b/i.test(
+      /\b(dhokh[ae]|dhoka|bakwas|bakwaas|ghatiya|chor|lutera|looters|police\s+complaint|paise\s+(?:khaa|lut|loot)|bekar\s+service|farzi)\b/i.test(
+        combined
+      ) ||
+      /(?:धोखा|फ्रॉड|बकवास|घटिया|चोर|पुलिस|कंज्यूमर\s*कोर्ट|पैसे\s*खा)/.test(
         combined
       ))
   ) {
@@ -986,13 +1087,16 @@ export function detectMandatoryHumanEscalation(params: {
     };
   }
 
-  // 3. Damaged / Defective / Wrong Item Claim (English + Hinglish)
+  // 3. Damaged / Defective / Wrong Item Claim (English + Hinglish + Hindi Devanagari)
   if (
     enabled.has("damaged_or_wrong_item") &&
-    (/\b(damaged|defective|torn|stained|broken|ripped|wrong\s+(?:item|product|dress|kurta|suit|color|colour|order)|different\s+product|missing\s+item|received\s+used)\b/i.test(
+    (/\b(damaged|defective|torn|stained|broken|ripped|cracked|wrong\s+(?:item|product|dress|kurta|suit|color|colour|order|mala|bracelet|incense|pack)|different\s+product|missing\s+item|received\s+used)\b/i.test(
       combined
     ) ||
-      /\b(toota|tuta|phata|fata|kharab|galat\s+(?:item|product|saman|saamaan|size|piece|colour|color)|alag\s+(?:item|product))\b/i.test(
+      /\b(toot[ai]?|tut[ai]?|phat[ai]?|fat[ai]?|kharab|kharaab|damage\s+aaya|galat\s+(?:item|product|saman|saamaan|size|piece|colour|color|order|mala)|alag\s+(?:item|product|saman))\b/i.test(
+        combined
+      ) ||
+      /(?:टूटा|फटा|खराब|गलत\s*(?:सामान|प्रोडक्ट|आइटम|ऑर्डर)|डैमेज)/.test(
         combined
       ))
   ) {
@@ -1006,13 +1110,16 @@ export function detectMandatoryHumanEscalation(params: {
     };
   }
 
-  // 4. Manual Refund / Bank Transfer / Money Back Request (English + Hinglish)
+  // 4. Manual Refund / Bank Transfer / Money Back Request (English + Hinglish + Hindi Devanagari)
   if (
     enabled.has("manual_refund_or_bank_transfer") &&
-    (/\b(bank\s+transfer|neft|imps|upi\s+refund|cash\s+refund|refund\s+(?:my\s+)?money|money\s+back|return\s+and\s+refund|want\s+(?:a\s+)?refund|full\s+refund|chargeback|refund\s+to\s+account)\b/i.test(
+    (/\b(bank\s+transfer|neft|imps|upi\s+refund|cash\s+refund|refund\s+(?:my\s+)?(?:money|amount|payment)|money\s+back|return\s+and\s+refund|want\s+(?:a\s+|my\s+)?refund|need\s+(?:a\s+|my\s+)?refund|give\s+(?:me\s+)?(?:a\s+|my\s+)?refund|full\s+refund|chargeback|refund\s+to\s+(?:account|upi|bank|source))\b/i.test(
       combined
     ) ||
-      /\b(pais[ae]\s+wapas|refund\s+chahiye|upi\s+(?:pe|par|me)\s+(?:bhej|send|refund)|account\s+me\s+(?:bhej|refund))\b/i.test(
+      /\b(pais[ae]\s+(?:wapas|vapas|return)|refund\s+(?:chahiye|k(?:ar|r)(?:o|do|iye)|kab\s+milega|de\s+do)|upi\s+(?:pe|par|me)\s+(?:bhej|send|refund)|account\s+me\s+(?:bhej|refund))\b/i.test(
+        combined
+      ) ||
+      /(?:पैसे\s*वापस|पैसा\s*वापस|रिफंड\s*(?:चाहिए|करो|दो|कब)|बैंक\s*ट्रांसफर)/.test(
         combined
       ))
   ) {
@@ -1031,9 +1138,10 @@ export function detectMandatoryHumanEscalation(params: {
     params.storeContext.highestOrderTotal >= params.vipThreshold ||
     params.storeContext.hasVipOrder;
   const hasVipIssueKeyword =
-    /\b(cancel|delayed|late|urgent|wedding|event|not\s+delivered|stuck|ndr|custom|alteration|problem|issue|complaint|shadi)\b/i.test(
+    /\b(cancel|delayed|delay|late|urgent|wedding|event|not\s+delivered|not\s+received|stuck|ndr|custom|alteration|problem|issue|complaint|shadi|aaya\s+n(?:a)?hi|mila\s+n(?:a)?hi|kab\s+aayega|kaha\s+hai)\b/i.test(
       combined
-    );
+    ) ||
+    /(?:डिले|लेट|कैंसिल|नहीं\s*(?:आया|मिला)|कब\s*(?:आएगा|मिलेगा))/.test(combined);
 
   if (enabled.has("vip_high_value_order") && isVip && hasVipIssueKeyword) {
     return {
@@ -1102,8 +1210,11 @@ function buildDeterministicFallbackDecision(params: {
 
   // Check if customer is asking about order status / tracking or providing an Order ID
   const isOrderStatusQuery =
-    /\b(where\s+is\s+my\s+order|order\s+status|order\s+id|track|tracking|awb|when\s+will\s+(?:it|my\s+order)\s+(?:arrive|come|deliver|ship)|dispatch|delivery\s+status)\b/i.test(
+    /\b(where\s+is\s+my\s+order|order\s+status|order\s+id|track|tracking|awb|when\s+will\s+(?:it|my\s+order)\s+(?:arrive|come|deliver|ship)|dispatch|delivery\s+status|not\s+received\s+(?:yet|my)|order\s+kab|kab\s+(?:tak\s+)?(?:aayega|milega|deliver)|aaya\s+n(?:a)?hi|mila\s+n(?:a)?hi|mera\s+order)\b/i.test(
       lower
+    ) ||
+    /(?:मेरा\s*(?:ऑर्डर|आर्डर|पार्सल)|कब\s*तक\s*(?:मिल|आएगा|आयेगा)|नहीं\s*(?:मिला|आया))/.test(
+      latestCustomerText
     ) ||
     /(?:#|\b)[A-Z]{1,4}\d{4,}\b/i.test(latestCustomerText) ||
     storeContext.extractedHints.orderCodes.length > 0;
@@ -1199,21 +1310,28 @@ function buildDeterministicFallbackDecision(params: {
     };
   }
 
-  // Check if Hybrid RAG has a strong knowledge match (policy, product, FAQ, or learned admin memory)
-  const topChunk = storeContext.ragChunks[0];
+  // Check if Hybrid RAG has a strong knowledge match (policy, product, FAQ, or learned admin memory; skip raw reply templates)
+  const topChunk =
+    storeContext.ragChunks.find((c) => c.category !== "template") || storeContext.ragChunks[0];
   if (
     topChunk &&
     (storeContext.topLexicalScore >= 0.3 || storeContext.topVectorSimilarity >= 0.45)
   ) {
-    const cleanBody = topChunk.content
-      .replace(/^#+\s+.+$/gm, "")
-      .replace(/\n{2,}/g, "\n")
-      .trim();
+    const cleanBody = cleanRagTextForCustomerReply(
+      topChunk.content
+        .replace(/^#+\s+.+$/gm, "")
+        .replace(/\n{2,}/g, "\n")
+        .trim(),
+      firstName,
+      primaryOrder?.channelOrderId || "",
+    );
     return {
       decision: "auto_reply",
       confidence: 0.88,
       reasoning: `Matched verified store knowledge from "${topChunk.documentTitle}" (RRF: ${topChunk.rrfScore}, Lexical: ${topChunk.lexicalScore}).`,
-      customerReplyDraft: `Hi ${firstName},\n\n${cleanBody}\n\nPlease let us know if you need any further assistance!${signOff}`,
+      customerReplyDraft: cleanBody.startsWith(`Hi ${firstName}`)
+        ? cleanBody
+        : `Hi ${firstName},\n\n${cleanBody}\n\nPlease let us know if you need any further assistance!${signOff}`,
       shouldResolveTicket: true,
       suggestedPriority: "normal",
       suggestedTags: ["AI Answered", topChunk.category],
@@ -1404,6 +1522,13 @@ Return JSON with fields:
       ? [...new Set(rawCitedIds)]
       : storeContext.ragChunks.slice(0, 3).map((c) => c.documentId);
 
+  const firstNameForClean =
+    (customerName || "there").trim().split(/\s+/)[0].replace(/^@/, "") || "there";
+  const primaryOrderCodeForClean =
+    ordersVerified && storeContext.orders[0]?.channelOrderId
+      ? storeContext.orders[0].channelOrderId
+      : "";
+
   // Post-LLM Deterministic Guardrail Enforcement
   const finalDecision: AiAgentDecision = {
     decision: ["auto_reply", "ask_admin_context", "human_action_required"].includes(
@@ -1415,7 +1540,11 @@ Return JSON with fields:
       ? Math.max(0, Math.min(1, Number(rawDecision.confidence)))
       : 0.5,
     reasoning: String(rawDecision?.reasoning || ""),
-    customerReplyDraft: String(rawDecision?.customerReplyDraft || "").trim(),
+    customerReplyDraft: cleanRagTextForCustomerReply(
+      String(rawDecision?.customerReplyDraft || "").trim(),
+      firstNameForClean,
+      primaryOrderCodeForClean,
+    ),
     shouldResolveTicket: Boolean(rawDecision?.shouldResolveTicket),
     suggestedPriority: ["low", "normal", "high", "urgent"].includes(
       String(rawDecision?.suggestedPriority)
@@ -1598,6 +1727,8 @@ export async function runAiAgentOnTicket(params: {
     });
 
     // 2. Retrieve Two-Tier Whole-Store Context (Live Orders + Hybrid Vector/FTS RAG)
+    // Embed primarily subject + latestCustomerText (stripped of boilerplate) so older email thread
+    // history never dilutes semantic retrieval, while passing recentHistoryText separately for Tier 1 order hints.
     const recentHistoryText = messages
       .filter((m) => m.direction === "inbound" && !isSystemNoiseBody(String(m.body || "")))
       .slice(-6)
@@ -1605,9 +1736,22 @@ export async function runAiAgentOnTicket(params: {
       .filter(Boolean)
       .join("\n");
 
+    const rawSubject = String(ticket.subject || "").trim();
+    const isGenericSocialSubject =
+      /^(?:facebook\s+message\s+from|instagram\s+dm\s+from|\(no\s+subject\)|\.+)$/i.test(rawSubject) ||
+      rawSubject.toLowerCase() === latestCustomerText.toLowerCase();
+    const focusedQuery = [
+      isGenericSocialSubject ? "" : stripRetrievalBoilerplate(rawSubject),
+      stripRetrievalBoilerplate(latestCustomerText),
+    ]
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+
     const storeContext = await retrieveStoreContext({
-      query: `${String(ticket.subject || "")}\n${recentHistoryText}\n${latestCustomerText}`.trim(),
+      query: focusedQuery || latestCustomerText || rawSubject,
       latestMessageText: latestCustomerText,
+      threadContextText: recentHistoryText,
       ticketId: params.ticketId,
       customerEmail: String(ticket.reply_to_email || ticket.customer_email || ""),
       associatedPhone: String(ticket.associated_phone || ""),
@@ -2419,7 +2563,12 @@ export async function autoDraftPendingInboundTickets(
   let processed = 0;
   let drafted = 0;
   let escalated = 0;
-  for (const ticketId of candidateIds) {
+  const paceMs = Math.max(0, Number(process.env.AI_BATCH_PACE_MS ?? 650));
+  for (let idx = 0; idx < candidateIds.length; idx++) {
+    const ticketId = candidateIds[idx];
+    if (idx > 0 && paceMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, paceMs));
+    }
     try {
       const res = await runAiAgentOnTicket({ ticketId, actorId: "auto_inbound" });
       processed++;
@@ -2481,13 +2630,13 @@ export function isOrderSpecificQueryOrCorrection(params: {
   }
 
   if (
-    /\b(where\s+is\s+my\s+order|my\s+order\s+(?:status|tracking|id)|track\s+my\s+order|order\s+status\s+(?:for|of)|dispatched\s+(?:on|via)|out\s+for\s+delivery|delivered\s+(?:on|to)|in\s+transit|stuck\s+in\s+transit|ndr\s+re-?attempt|your\s+order\s+#?[A-Z0-9-]+|specific\s+order)\b/i.test(
+    /\b(where\s+is\s+my\s+order|my\s+order\s+(?:status|tracking|id)|track\s+my\s+order|order\s+status\s+(?:for|of)|dispatched\s+(?:on|via)|out\s+for\s+delivery|delivered\s+(?:on|to)|in\s+transit|stuck\s+in\s+transit|ndr\s+re-?attempt|your\s+order\s+#?[A-Z0-9-]+|specific\s+order|where\s+is\s+my\s+refund|my\s+refund\s+(?:status|amount)|refund\s+(?:has\s+been|was|is)\s+(?:processed|initiated|credited|approved|sent)|refund\s+for\s+(?:your|my)\s+order|refund\s+of\s+(?:₹|rs\.?)\s*\d+|utr\s*(?:no|number|id)?[\s:#-]*[a-z0-9]+)\b/i.test(
       combined,
     )
   ) {
     return {
       isOrderSpecific: true,
-      reason: "Query or correction is specific to an individual customer's order/shipment status",
+      reason: "Query or correction is specific to an individual customer's order, shipment, or refund status",
     };
   }
 

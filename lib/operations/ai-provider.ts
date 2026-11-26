@@ -42,10 +42,51 @@ export function estimateAiCostUsd(
 export const EMBEDDING_DIM = 768;
 export const DEFAULT_GEMINI_CHAT_MODEL =
   process.env.GEMINI_MODEL || "gemini-2.5-flash";
+export const FALLBACK_GEMINI_CHAT_MODELS = [
+  process.env.GEMINI_FALLBACK_MODEL || "gemini-3.5-flash-lite",
+  "gemini-3-flash-preview",
+  "gemini-flash-lite-latest",
+  "gemini-2.5-flash-lite",
+];
 export const DEFAULT_GEMINI_EMBED_MODELS = [
   process.env.GEMINI_EMBEDDING_MODEL || "gemini-embedding-001",
-  "text-embedding-004",
 ];
+
+const unavailableLiveGeminiModels = new Set<string>();
+const rateLimitedLiveGeminiModels = new Map<string, number>();
+
+function redactSecrets(raw: string): string {
+  return String(raw || "")
+    .replace(/AIza[0-9A-Za-z_-]{20,}/g, "[REDACTED_GEMINI_KEY]")
+    .replace(/sk-[0-9A-Za-z_-]{16,}/g, "[REDACTED_OPENAI_KEY]")
+    .replace(/(key|token|secret|password)=([^&\s]+)/gi, "$1=[REDACTED]")
+    .slice(0, 320);
+}
+
+export function logAiProviderWarning(
+  operation: string,
+  details: Record<string, unknown>,
+): void {
+  const safeDetails: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(details)) {
+    safeDetails[k] = typeof v === "string" ? redactSecrets(v) : v;
+  }
+  console.warn(`[ai-provider:${operation}]`, JSON.stringify(safeDetails));
+}
+
+async function sleepWithJitter(attempt: number, defaultBaseMs = 800): Promise<void> {
+  const envBase = Number(process.env.AI_PROVIDER_RETRY_BASE_MS);
+  const baseMs = Number.isFinite(envBase) && envBase >= 0 ? envBase : defaultBaseMs;
+  if (baseMs === 0) return;
+  const exp = baseMs * Math.pow(2, Math.max(0, attempt));
+  const jitter = Math.floor(Math.random() * Math.min(250, Math.max(20, baseMs * 0.4)));
+  const delayMs = Math.min(8000, exp + jitter);
+  await new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+function isRetryableHttpStatus(status: number): boolean {
+  return status === 408 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
 
 export function getGeminiApiKey(): string {
   return (
@@ -197,51 +238,86 @@ export async function embedText(
 
   const approxTokens = estimateTokenCount(clean);
   const geminiKey = getGeminiApiKey();
+  const embedTimeoutMs = Math.max(5000, Number(process.env.GEMINI_EMBED_TIMEOUT_MS || 20000));
   if (geminiKey) {
     for (const modelName of DEFAULT_GEMINI_EMBED_MODELS) {
-      try {
-        const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-          modelName
-        )}:embedContent`;
-        const res = await fetch(endpoint, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-goog-api-key": geminiKey,
-          },
-          body: JSON.stringify({
-            model: `models/${modelName}`,
-            content: { parts: [{ text: clean }] },
-            taskType,
-            outputDimensionality: EMBEDDING_DIM,
-          }),
-          signal: AbortSignal.timeout(15000),
-        });
-        if (res.ok) {
-          const data = (await res.json()) as {
-            embedding?: { values?: number[] };
-          };
-          const values = data?.embedding?.values;
-          if (Array.isArray(values) && values.length > 0) {
-            const resized =
-              values.length >= EMBEDDING_DIM
-                ? values.slice(0, EMBEDDING_DIM)
-                : [...values, ...new Array(EMBEDDING_DIM - values.length).fill(0)];
-            return {
-              embedding: normalizeVector(resized),
-              model: modelName,
-              usage: {
-                inputTokens: approxTokens,
-                outputTokens: 0,
-                totalTokens: approxTokens,
-                estimatedCostUsd: estimateAiCostUsd(modelName, approxTokens, 0),
-                isEstimated: true,
-              },
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+        modelName
+      )}:embedContent`;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const res = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-goog-api-key": geminiKey,
+            },
+            body: JSON.stringify({
+              model: `models/${modelName}`,
+              content: { parts: [{ text: clean }] },
+              taskType,
+              outputDimensionality: EMBEDDING_DIM,
+            }),
+            signal: AbortSignal.timeout(embedTimeoutMs),
+          });
+          if (res.ok) {
+            const data = (await res.json()) as {
+              embedding?: { values?: number[] };
             };
+            const values = data?.embedding?.values;
+            if (Array.isArray(values) && values.length > 0) {
+              const resized =
+                values.length >= EMBEDDING_DIM
+                  ? values.slice(0, EMBEDDING_DIM)
+                  : [...values, ...new Array(EMBEDDING_DIM - values.length).fill(0)];
+              return {
+                embedding: normalizeVector(resized),
+                model: modelName,
+                usage: {
+                  inputTokens: approxTokens,
+                  outputTokens: 0,
+                  totalTokens: approxTokens,
+                  estimatedCostUsd: estimateAiCostUsd(modelName, approxTokens, 0),
+                  isEstimated: true,
+                },
+              };
+            }
+            logAiProviderWarning("embedText", {
+              model: modelName,
+              attempt: attempt + 1,
+              reason: "empty_embedding_values",
+            });
+            break;
+          }
+
+          const errSnippet = await res.text().catch(() => "");
+          logAiProviderWarning("embedText", {
+            model: modelName,
+            attempt: attempt + 1,
+            status: res.status,
+            error: errSnippet.slice(0, 220),
+          });
+
+          if (isRetryableHttpStatus(res.status) && attempt < 2) {
+            await sleepWithJitter(attempt, 700);
+            continue;
+          }
+          break;
+        } catch (err) {
+          const isTimeout =
+            err instanceof Error &&
+            (err.name === "TimeoutError" || err.name === "AbortError" || /timeout|aborted/i.test(err.message));
+          logAiProviderWarning("embedText", {
+            model: modelName,
+            attempt: attempt + 1,
+            reason: isTimeout ? "timeout" : "network_error",
+            error: err instanceof Error ? err.message : String(err),
+          });
+          if (attempt < 2) {
+            await sleepWithJitter(attempt, 700);
+            continue;
           }
         }
-      } catch {
-        // Try next Gemini embedding model or fall back cleanly
       }
     }
   }
@@ -351,83 +427,175 @@ export async function generateStructuredJson<T>(params: {
   );
 
   if (geminiKey) {
-    const model = DEFAULT_GEMINI_CHAT_MODEL;
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-      model
-    )}:generateContent`;
+    const candidateModels = [
+      ...new Set([DEFAULT_GEMINI_CHAT_MODEL, ...FALLBACK_GEMINI_CHAT_MODELS].filter(Boolean)),
+    ];
+    const chatTimeoutMs = Math.max(5000, Number(process.env.GEMINI_TIMEOUT_MS || 28000));
+    const configuredThinkingBudget = Number(process.env.GEMINI_THINKING_BUDGET ?? 0);
+    const thinkingBudget =
+      Number.isFinite(configuredThinkingBudget) && configuredThinkingBudget >= 0
+        ? Math.min(1024, Math.round(configuredThinkingBudget))
+        : 0;
 
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const res = await fetch(endpoint, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-goog-api-key": geminiKey,
-          },
-          body: JSON.stringify({
-            systemInstruction: {
-              parts: [{ text: params.systemInstruction }],
-            },
-            contents: [
-              {
-                role: "user",
-                parts: [{ text: params.userPrompt }],
-              },
-            ],
-            generationConfig: {
-              temperature,
-              responseMimeType: "application/json",
-            },
-          }),
-          signal: AbortSignal.timeout(20000),
-        });
+    const isMockRetryTest = Boolean(process.env.AI_PROVIDER_RETRY_BASE_MS);
+    const activeModels = isMockRetryTest
+      ? candidateModels
+      : candidateModels.filter((m) => !unavailableLiveGeminiModels.has(m));
 
-        if (res.status === 429 && attempt === 0) {
-          await new Promise((r) => setTimeout(r, 1200));
+    for (let modelIdx = 0; modelIdx < activeModels.length; modelIdx++) {
+      const model = activeModels[modelIdx];
+      if (!isMockRetryTest && unavailableLiveGeminiModels.has(model)) {
+        continue;
+      }
+      const hasUnthrottledLaterModel =
+        !isMockRetryTest &&
+        activeModels
+          .slice(modelIdx + 1)
+          .some((m) => (rateLimitedLiveGeminiModels.get(m) || 0) <= Date.now());
+
+      if (!isMockRetryTest && hasUnthrottledLaterModel) {
+        const cooldownUntil = rateLimitedLiveGeminiModels.get(model) || 0;
+        if (cooldownUntil > Date.now()) {
           continue;
         }
+      }
+      const maxAttempts = modelIdx === 0 ? 3 : 2;
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+        model
+      )}:generateContent`;
+      const supportsThinkingConfig = /^gemini-2\.5-flash$/i.test(model);
 
-        if (res.ok) {
-          const payload = (await res.json()) as {
-            candidates?: Array<{
-              content?: { parts?: Array<{ text?: string }> };
-            }>;
-            usageMetadata?: {
-              promptTokenCount?: number;
-              candidatesTokenCount?: number;
-              totalTokenCount?: number;
-            };
-          };
-          const rawText =
-            payload?.candidates?.[0]?.content?.parts
-              ?.map((p) => p.text || "")
-              .join("\n") || "";
-          const parsed = parseJsonFromLlmOutput<T>(rawText);
-          if (parsed !== null) {
-            const um = payload?.usageMetadata;
-            const inputTokens = Number(um?.promptTokenCount ?? estimatedInputTokens);
-            const outputTokens = Number(
-              um?.candidatesTokenCount ?? estimateTokenCount(rawText),
-            );
-            const totalTokens = Number(
-              um?.totalTokenCount ?? inputTokens + outputTokens,
-            );
-            return {
-              data: parsed,
-              provider: "gemini",
-              model,
-              usage: {
-                inputTokens,
-                outputTokens,
-                totalTokens,
-                estimatedCostUsd: estimateAiCostUsd(model, inputTokens, outputTokens),
-                isEstimated: !um?.promptTokenCount,
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        try {
+          const res = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-goog-api-key": geminiKey,
+            },
+            body: JSON.stringify({
+              systemInstruction: {
+                parts: [{ text: params.systemInstruction }],
               },
+              contents: [
+                {
+                  role: "user",
+                  parts: [{ text: params.userPrompt }],
+                },
+              ],
+              generationConfig: {
+                temperature,
+                responseMimeType: "application/json",
+                ...(supportsThinkingConfig
+                  ? { thinkingConfig: { thinkingBudget } }
+                  : {}),
+              },
+            }),
+            signal: AbortSignal.timeout(chatTimeoutMs),
+          });
+
+          if (res.ok) {
+            const payload = (await res.json()) as {
+              candidates?: Array<{
+                content?: { parts?: Array<{ text?: string }> };
+                finishReason?: string;
+              }>;
+              usageMetadata?: {
+                promptTokenCount?: number;
+                candidatesTokenCount?: number;
+                totalTokenCount?: number;
+              };
             };
+            const rawText =
+              payload?.candidates?.[0]?.content?.parts
+                ?.map((p) => p.text || "")
+                .join("\n") || "";
+            const parsed = parseJsonFromLlmOutput<T>(rawText);
+            if (parsed !== null) {
+              const um = payload?.usageMetadata;
+              const inputTokens = Number(um?.promptTokenCount ?? estimatedInputTokens);
+              const outputTokens = Number(
+                um?.candidatesTokenCount ?? estimateTokenCount(rawText),
+              );
+              const totalTokens = Number(
+                um?.totalTokenCount ?? inputTokens + outputTokens,
+              );
+              return {
+                data: parsed,
+                provider: "gemini",
+                model,
+                usage: {
+                  inputTokens,
+                  outputTokens,
+                  totalTokens,
+                  estimatedCostUsd: estimateAiCostUsd(model, inputTokens, outputTokens),
+                  isEstimated: !um?.promptTokenCount,
+                },
+              };
+            }
+
+            logAiProviderWarning("generateStructuredJson", {
+              model,
+              attempt: attempt + 1,
+              reason: "json_parse_failure",
+              finishReason: payload?.candidates?.[0]?.finishReason || "UNKNOWN",
+              snippet: rawText.slice(0, 200),
+            });
+            if (attempt + 1 < maxAttempts) {
+              await sleepWithJitter(attempt, 500);
+              continue;
+            }
+            break;
+          }
+
+          const errSnippet = await res.text().catch(() => "");
+          logAiProviderWarning("generateStructuredJson", {
+            model,
+            attempt: attempt + 1,
+            status: res.status,
+            error: errSnippet.slice(0, 240),
+          });
+
+          if (res.status === 404) {
+            if (!isMockRetryTest) {
+              unavailableLiveGeminiModels.add(model);
+            }
+            // Model unavailable for this key/project -> immediately try next fallback model
+            break;
+          }
+
+          if (res.status === 429 && !isMockRetryTest) {
+            rateLimitedLiveGeminiModels.set(
+              model,
+              Date.now() + (modelIdx === 0 ? 60_000 : 10_000),
+            );
+            if (hasUnthrottledLaterModel) {
+              // Fail over immediately to an available unthrottled fallback model
+              break;
+            }
+          }
+
+          if (isRetryableHttpStatus(res.status) && attempt + 1 < maxAttempts) {
+            await sleepWithJitter(attempt, 850);
+            continue;
+          }
+          break;
+        } catch (err) {
+          const isTimeout =
+            err instanceof Error &&
+            (err.name === "TimeoutError" || err.name === "AbortError" || /timeout|aborted/i.test(err.message));
+          logAiProviderWarning("generateStructuredJson", {
+            model,
+            attempt: attempt + 1,
+            reason: isTimeout ? "timeout" : "network_error",
+            timeoutMs: chatTimeoutMs,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          if (attempt + 1 < maxAttempts) {
+            await sleepWithJitter(attempt, 850);
+            continue;
           }
         }
-      } catch {
-        // Retry once on transient network/timeout error
       }
     }
   }

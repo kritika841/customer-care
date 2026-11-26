@@ -3,6 +3,8 @@ import { isPgVectorAvailable, operationsDb } from "./schema";
 import { computeCustomer360, extractOrderOrPhoneHints, type Customer360Summary } from "./sla";
 import {
   cosineSimilarity,
+  DEFAULT_GEMINI_EMBED_MODELS,
+  deterministicLocalEmbedding,
   embedText,
   estimateTokenCount,
   getConfiguredAiProviderInfo,
@@ -289,7 +291,12 @@ export async function upsertKnowledgeDocument(params: {
     KnowledgeChunkDraft & { id: string; embedding: number[]; embeddingModel: string }
   > = [];
 
-  for (const draft of chunkDrafts) {
+  const embedPaceMs = Math.max(0, Number(process.env.RAG_EMBED_PACE_MS ?? 60));
+  for (let idx = 0; idx < chunkDrafts.length; idx++) {
+    const draft = chunkDrafts[idx];
+    if (idx > 0 && embedPaceMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, embedPaceMs));
+    }
     const textToEmbed = `${draft.heading}\n${draft.content}`;
     const { embedding, model } = await embedText(textToEmbed, "RETRIEVAL_DOCUMENT");
     lastModel = model;
@@ -449,6 +456,37 @@ function stripHtmlTags(html: string): string {
     .trim();
 }
 
+/**
+ * Removes storefront UI buttons, quantity controls, form labels, carousel arrows,
+ * URL boilerplate, and un-interpolated template variables from scraped or synced KB text.
+ */
+export function cleanScrapedStoreText(raw: string): string {
+  return String(raw || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\u00a0/g, " ")
+    .replace(/^Source:\s*https?:\/\/\S+\s*$/gim, "")
+    .replace(/\{\{\s*(?:customer_name|first_name|name)\s*\}\}/gi, "Customer")
+    .replace(/\{\{\s*(?:order_id|order_number|order_code)\s*\}\}/gi, "your order")
+    .replace(/\{\{[^{}\n]*\}\}/g, "")
+    .replace(/\b(?:ADD TO BOX|BUY IT NOW|Add to Cart|Buy Now)\b/gi, "")
+    .replace(/[✕❮❯]/g, "")
+    .split("\n")
+    .map((line) => line.replace(/[ \t]{2,}/g, " ").trim())
+    .filter((line) => {
+      if (!line) return true;
+      if (/^(?:ADD TO BOX|Add to Box|BUY IT NOW|Buy It Now|TRACK ORDER|Send Message|1 added|AS SEEN IN|As Seen On|−|\+|-|×|✕|❮|❯)$/i.test(line)) {
+        return false;
+      }
+      if (/^(?:First Name|Last Name|Email|Phone Number|Message|Submit|Subscribe)$/i.test(line)) {
+        return false;
+      }
+      return true;
+    })
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 type ShopifyProductApiItem = {
   id: number | string;
   title?: string;
@@ -532,27 +570,32 @@ async function fetchShopifyCatalogProducts(): Promise<{
 
     for (const p of products.slice(0, 250)) {
       if (!p.id || !p.title) continue;
-      const description = stripHtmlTags(p.body_html || "");
+      const description = cleanScrapedStoreText(stripHtmlTags(p.body_html || ""));
       const tags = Array.isArray(p.tags)
         ? p.tags.join(", ")
         : String(p.tags || "").trim();
-      const variants = p.variants || [];
-      const variantLines = variants.map((v) => {
-        const sizeOrVariant = v.title && v.title !== "Default Title" ? v.title : "Standard";
-        const price = v.price ? `₹${v.price}` : "";
-        const compare =
-          v.compare_at_price && Number(v.compare_at_price) > Number(v.price || 0)
-            ? ` (MRP ₹${v.compare_at_price})`
-            : "";
-        const sku = v.sku ? ` | SKU: ${v.sku}` : "";
-        const stock =
-          typeof v.inventory_quantity === "number"
-            ? v.inventory_quantity > 0
-              ? ` | In Stock (${v.inventory_quantity})`
-              : " | Out of Stock"
-            : "";
-        return `- Variant/Size: ${sizeOrVariant} | Price: ${price}${compare}${sku}${stock}`;
+      const variants = (p.variants || []).filter((v) => {
+        const numericPrice = Number(v.price ?? 0);
+        return !Number.isFinite(numericPrice) || numericPrice > 0 || (p.variants || []).length === 1;
       });
+      const variantLines = variants
+        .filter((v) => v.price === undefined || Number(v.price) > 0)
+        .map((v) => {
+          const sizeOrVariant = v.title && v.title !== "Default Title" ? v.title : "Standard";
+          const price = v.price && Number(v.price) > 0 ? `₹${v.price}` : "";
+          const compare =
+            v.compare_at_price && Number(v.compare_at_price) > Number(v.price || 0)
+              ? ` (MRP ₹${v.compare_at_price})`
+              : "";
+          const sku = v.sku ? ` | SKU: ${v.sku}` : "";
+          const stock =
+            typeof v.inventory_quantity === "number"
+              ? v.inventory_quantity > 0
+                ? ` | In Stock (${v.inventory_quantity})`
+                : " | Out of Stock"
+              : "";
+          return `- Variant/Size: ${sizeOrVariant}${price ? ` | Price: ${price}` : ""}${compare}${sku}${stock}`;
+        });
 
       const docContent = [
         `# Product: ${p.title}`,
@@ -685,15 +728,23 @@ const SATMI_WEBSITE_PAGES: Array<{
   },
 ];
 
-function extractReadableMainHtml(html: string): string {
-  const withoutHead = html
+export function extractReadableMainHtml(html: string): string {
+  const withoutHead = String(html || "")
     .replace(/<head[\s\S]*?<\/head>/gi, "")
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<style[\s\S]*?<\/style>/gi, "")
     .replace(/<svg[\s\S]*?<\/svg>/gi, "")
     .replace(/<noscript[\s\S]*?<\/noscript>/gi, "")
     .replace(/<header[\s\S]*?<\/header>/gi, "")
-    .replace(/<footer[\s\S]*?<\/footer>/gi, "");
+    .replace(/<footer[\s\S]*?<\/footer>/gi, "")
+    .replace(/<nav[\s\S]*?<\/nav>/gi, "")
+    .replace(/<aside[\s\S]*?<\/aside>/gi, "")
+    .replace(/<dialog[\s\S]*?<\/dialog>/gi, "")
+    .replace(/<form[\s\S]*?<\/form>/gi, "")
+    .replace(/<button[\s\S]*?<\/button>/gi, " ")
+    .replace(/<select[\s\S]*?<\/select>/gi, " ")
+    .replace(/<textarea[\s\S]*?<\/textarea>/gi, " ")
+    .replace(/<input[^>]*>/gi, " ");
 
   const mainMatch =
     withoutHead.match(/<main[^>]*>([\s\S]*?)<\/main>/i) ||
@@ -701,11 +752,7 @@ function extractReadableMainHtml(html: string): string {
     withoutHead.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
 
   const segment = mainMatch?.[1] || withoutHead;
-  return stripHtmlTags(segment)
-    .replace(/[ \t]{2,}/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim()
-    .slice(0, 18000);
+  return cleanScrapedStoreText(stripHtmlTags(segment)).slice(0, 18000);
 }
 
 async function scrapeSatmiWebsiteToRag(actorId = "web_scraper"): Promise<number> {
@@ -726,7 +773,7 @@ async function scrapeSatmiWebsiteToRag(actorId = "web_scraper"): Promise<number>
         title: page.title,
         category: page.category,
         sourceRef: page.sourceRef,
-        content: `# ${page.title}\nSource: ${page.url}\n\n${readable}`,
+        content: `# ${page.title}\n\n${readable}`,
         metadata: { url: page.url, source: "satmi.in" },
         actorId,
       });
@@ -803,8 +850,9 @@ export async function syncStoreKnowledgeToRag(actorId = "system"): Promise<{
       const prodName = String(prod.name || prod.title || prod.sku || "");
       if (!prodId || !prodName) continue;
       const sku = String(prod.sku || "");
-      const price = prod.price != null ? `₹${prod.price}` : "";
-      const desc = String(prod.description || prod.notes || "");
+      const numPrice = Number(prod.price ?? 0);
+      const price = prod.price != null && (!Number.isFinite(numPrice) || numPrice > 0) ? `₹${prod.price}` : "";
+      const desc = cleanScrapedStoreText(String(prod.description || prod.notes || ""));
       const content = [
         `# Inventory Product: ${prodName}`,
         sku ? `SKU: ${sku}` : "",
@@ -854,6 +902,12 @@ export async function syncStoreKnowledgeToRag(actorId = "system"): Promise<{
           itemObj.name || itemObj.title || itemObj.product_name || ""
         ).trim();
         if (!name) continue;
+        const price = itemObj.price ?? itemObj.selling_price ?? itemObj.total;
+        const numericPrice = price != null && String(price).trim() !== "" ? Number(price) : NaN;
+        // Skip ₹0.00 freebie/gift line-items so they do not pollute catalog pricing
+        if (Number.isFinite(numericPrice) && numericPrice <= 0 && /\b(?:free|gift)\b/i.test(name)) {
+          continue;
+        }
         const key = name.toLowerCase();
         const entry = discoveredCatalog.get(key) || {
           name,
@@ -863,8 +917,7 @@ export async function syncStoreKnowledgeToRag(actorId = "system"): Promise<{
         };
         const sku = String(itemObj.sku || itemObj.channel_sku || "").trim();
         if (sku) entry.skus.add(sku);
-        const price = itemObj.price ?? itemObj.selling_price ?? itemObj.total;
-        if (price != null && String(price).trim() !== "") {
+        if (Number.isFinite(numericPrice) && numericPrice > 0) {
           entry.prices.add(`₹${price}`);
         }
         entry.count++;
@@ -900,7 +953,7 @@ export async function syncStoreKnowledgeToRag(actorId = "system"): Promise<{
     localProductsSynced++;
   }
 
-  // 5. Sync Support Reply Templates
+  // 5. Sync Support Reply Templates (cleaned of {{customer_name}} / {{order_id}} raw placeholders)
   const templates = await db
     .prepare("SELECT id, name, body, macro_tags, shortcut FROM support_reply_templates")
     .all<Record<string, unknown>>()
@@ -909,7 +962,7 @@ export async function syncStoreKnowledgeToRag(actorId = "system"): Promise<{
   for (const tpl of templates.results) {
     const tplId = String(tpl.id || "");
     const tplName = String(tpl.name || "");
-    const tplBody = String(tpl.body || "");
+    const tplBody = cleanScrapedStoreText(String(tpl.body || ""));
     if (!tplId || !tplName || !tplBody) continue;
     await upsertKnowledgeDocument({
       title: `Approved Reply Template: ${tplName}`,
@@ -921,6 +974,9 @@ export async function syncStoreKnowledgeToRag(actorId = "system"): Promise<{
     });
     templatesSynced++;
   }
+
+  // 6. Repair any non-primary or legacy embeddings across the Knowledge Base
+  await repairKnowledgeChunkEmbeddings({ actorId }).catch(() => null);
 
   const counts = await db
     .prepare(
@@ -954,7 +1010,8 @@ function summarizeOrderProductsJson(rawJson: unknown): string {
         const qty = Number(item.quantity || item.units || 1);
         const sku = item.sku ? ` (SKU: ${item.sku})` : "";
         const price = item.price ?? item.selling_price;
-        const priceStr = price != null ? ` @ ₹${price}` : "";
+        const numPrice = price != null ? Number(price) : NaN;
+        const priceStr = Number.isFinite(numPrice) && numPrice > 0 ? ` @ ₹${price}` : "";
         return `${qty}x ${name}${sku}${priceStr}`;
       })
       .join("; ");
@@ -963,57 +1020,496 @@ function summarizeOrderProductsJson(rawJson: unknown): string {
   }
 }
 
-function computeKeywordLexicalScore(query: string, heading: string, content: string): number {
-  const stopWords = new Set([
-    "the",
-    "and",
-    "for",
-    "with",
-    "that",
-    "this",
-    "from",
-    "have",
-    "what",
-    "when",
-    "where",
-    "how",
-    "can",
-    "you",
-    "your",
-    "are",
-    "was",
-    "will",
-    "please",
-    "help",
-    "satmi",
-  ]);
-  const queryTerms = [
+/**
+ * Detects whether a 768-dim vector was produced by the sparse deterministic local hashed-ngram
+ * fallback (which leaves >450 zero dimensions) rather than a dense neural embedding model.
+ */
+export function isSparseHashedVector(vec: unknown): boolean {
+  let arr: unknown[] | null = null;
+  if (Array.isArray(vec)) {
+    arr = vec;
+  } else if (typeof vec === "string") {
+    try {
+      const parsed = JSON.parse(vec);
+      if (Array.isArray(parsed)) arr = parsed;
+    } catch {
+      return true;
+    }
+  }
+  if (!arr || arr.length === 0) return true;
+  let zeroCount = 0;
+  for (let i = 0; i < arr.length; i++) {
+    if ((Number(arr[i]) || 0) === 0) zeroCount++;
+  }
+  return zeroCount > arr.length * 0.15;
+}
+
+/**
+ * Targeted Repair & Re-Embed Routine:
+ * 1. Cleans any scraped storefront UI noise ({{customer_name}}, ADD TO BOX, Source URLs, ₹0.00 freebies)
+ *    from existing support_knowledge_documents and support_knowledge_chunks.
+ * 2. Re-embeds all chunks whose embedding_model does not match the primary configured model
+ *    (e.g. 'gemini-embedding-001') or whose vector is sparse/missing, with paced retry/backoff.
+ * 3. Backfills pgvector `embedding` column when the PostgreSQL `vector` extension is available.
+ */
+export async function repairKnowledgeChunkEmbeddings(params?: {
+  targetModel?: string;
+  forceAll?: boolean;
+  paceMs?: number;
+  actorId?: string;
+}): Promise<{
+  inspected: number;
+  cleanedDocs: number;
+  reEmbedded: number;
+  alreadyHealthy: number;
+  stillFallback: number;
+  targetModel: string;
+  pgVectorEnabled: boolean;
+}> {
+  const db = await operationsDb();
+  const providerInfo = getConfiguredAiProviderInfo();
+  const targetModel =
+    params?.targetModel ||
+    (providerInfo.provider === "gemini"
+      ? DEFAULT_GEMINI_EMBED_MODELS[0]
+      : providerInfo.embeddingModel);
+  const paceMs = Math.max(0, Number(params?.paceMs ?? process.env.RAG_EMBED_PACE_MS ?? 75));
+  const hasPgVector = await isPgVectorAvailable();
+
+  // Step 1: Clean polluted document content (UI chrome, {{customer_name}}, Source: https://...)
+  const allDocs = await db
+    .prepare("SELECT id, title, category, content FROM support_knowledge_documents")
+    .all<{ id: string; title: string; category: string; content: string }>()
+    .catch(() => ({ results: [] as Array<{ id: string; title: string; category: string; content: string }> }));
+
+  let cleanedDocs = 0;
+  for (const doc of allDocs.results) {
+    const cleaned = cleanScrapedStoreText(doc.content)
+      .replace(/\|\s*Typical Price:\s*₹0(?:\.00)?\b/gi, "")
+      .replace(/\|\s*Price:\s*₹0(?:\.00)?\b/gi, "");
+    if (cleaned && cleaned !== doc.content.trim()) {
+      await upsertKnowledgeDocument({
+        id: doc.id,
+        title: doc.title,
+        category: doc.category as KnowledgeCategory,
+        content: cleaned,
+        actorId: params?.actorId || "rag_repair",
+      });
+      cleanedDocs++;
+    }
+  }
+
+  // Step 2: Inspect all chunks and re-embed any non-targetModel or sparse hashed chunks
+  const chunkRows = await db
+    .prepare(
+      `SELECT id, document_id, heading, content, embedding_json, COALESCE(embedding_model, '') AS embedding_model
+       FROM support_knowledge_chunks
+       ORDER BY document_id, chunk_index ASC`,
+    )
+    .all<{
+      id: string;
+      document_id: string;
+      heading: string;
+      content: string;
+      embedding_json: unknown;
+      embedding_model: string;
+    }>();
+
+  let reEmbedded = 0;
+  let alreadyHealthy = 0;
+  let stillFallback = 0;
+
+  for (let i = 0; i < chunkRows.results.length; i++) {
+    const row = chunkRows.results[i];
+    const currentModel = String(row.embedding_model || "").trim();
+    const isSparse = isSparseHashedVector(row.embedding_json);
+    const cleanedChunkContent = cleanScrapedStoreText(row.content);
+    const contentChanged = cleanedChunkContent !== row.content.trim();
+
+    const needsReEmbed =
+      params?.forceAll === true ||
+      contentChanged ||
+      isSparse ||
+      currentModel !== targetModel;
+
+    if (!needsReEmbed) {
+      alreadyHealthy++;
+      continue;
+    }
+
+    // If vector is already dense (non-sparse) and only embedding_model label was blank from pre-0024 schema,
+    // and we didn't change content or forceAll, stamp the model name without wasting an API call
+    // unless GEMINI_API_KEY is configured and we want verified embeddings.
+    if (
+      !params?.forceAll &&
+      !contentChanged &&
+      !isSparse &&
+      currentModel === "" &&
+      targetModel === "gemini-embedding-001"
+    ) {
+      let existingVec: number[] | null = null;
+      if (Array.isArray(row.embedding_json)) {
+        existingVec = row.embedding_json as number[];
+      } else if (typeof row.embedding_json === "string") {
+        try {
+          existingVec = JSON.parse(row.embedding_json) as number[];
+        } catch {
+          existingVec = null;
+        }
+      }
+      if (existingVec && existingVec.length === 768) {
+        if (hasPgVector) {
+          const vectorLiteral = `[${existingVec.join(",")}]`;
+          await db
+            .prepare(
+              "UPDATE support_knowledge_chunks SET embedding_model = ?, embedding = ?::vector WHERE id = ?",
+            )
+            .bind(targetModel, vectorLiteral, row.id)
+            .run();
+        } else {
+          await db
+            .prepare("UPDATE support_knowledge_chunks SET embedding_model = ? WHERE id = ?")
+            .bind(targetModel, row.id)
+            .run();
+        }
+        reEmbedded++;
+        continue;
+      }
+    }
+
+    if (reEmbedded > 0 && paceMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, paceMs));
+    }
+
+    const safeContent = cleanedChunkContent || row.content;
+    const { embedding, model } = await embedText(
+      `${row.heading}\n${safeContent}`,
+      "RETRIEVAL_DOCUMENT",
+    );
+
+    if (model === "satmi-hashed-ngram-768" && targetModel !== "satmi-hashed-ngram-768") {
+      stillFallback++;
+    } else {
+      reEmbedded++;
+    }
+
+    if (hasPgVector) {
+      const vectorLiteral = `[${embedding.join(",")}]`;
+      await db
+        .prepare(
+          `UPDATE support_knowledge_chunks
+           SET content = ?, embedding_json = ?::jsonb, embedding_model = ?, embedding = ?::vector
+           WHERE id = ?`,
+        )
+        .bind(safeContent, JSON.stringify(embedding), model, vectorLiteral, row.id)
+        .run();
+    } else {
+      await db
+        .prepare(
+          `UPDATE support_knowledge_chunks
+           SET content = ?, embedding_json = ?::jsonb, embedding_model = ?
+           WHERE id = ?`,
+        )
+        .bind(safeContent, JSON.stringify(embedding), model, row.id)
+        .run();
+    }
+  }
+
+  return {
+    inspected: chunkRows.results.length,
+    cleanedDocs,
+    reEmbedded,
+    alreadyHealthy,
+    stillFallback,
+    targetModel,
+    pgVectorEnabled: hasPgVector,
+  };
+}
+
+const HINDI_HINGLISH_SYNONYM_RULES: Array<{
+  pattern: RegExp;
+  synonyms: string[];
+}> = [
+  {
+    pattern:
+      /(?:ऑर्डर|आर्डर|पार्सल|डिलीवरी|डिस्पैच|ट्रैक|कब\s*तक|कब\s*आएगा|कब\s*मिलेगा|नहीं\s*(?:मिला|आया)|मंगाया|\b(?:order|odar|ordr|parcel|magya|mangaya|mangwaya|aaya|aya|mila|nhi|nahi|nathi|aviyo|ekhono|kab\s+tak|kab\s+aayega|kab\s+milega|kaha\s+hai|kahan\s+hai|kitne\s+din|dispatch|delivery|track|tracking|awb)\b)/i,
+    synonyms: [
+      "order",
+      "shipping",
+      "delivery",
+      "dispatch",
+      "timeline",
+      "tracking",
+      "awb",
+      "courier",
+      "working",
+      "days",
+    ],
+  },
+  {
+    pattern:
+      /(?:रिटर्न|वापस|रिप्लेस|रिप्लेसमेंट|एक्सचेंज|रिफंड|कैंसिल|साइज|बदलना|\b(?:return|wapas|vapas|replace|replacement|exchange|refund|paise|paisa|cancel|badalna|size|unboxing)\b)/i,
+    synonyms: [
+      "refund",
+      "return",
+      "replacement",
+      "exchange",
+      "policy",
+      "unboxing",
+      "video",
+      "days",
+      "delivery",
+    ],
+  },
+  {
+    pattern:
+      /(?:टूटा|फटा|खराब|गलत|डैमेज|\b(?:toota|tuta|phata|fata|kharab|kharaab|galat|damaged|defective|broken|wrong|missing)\b)/i,
+    synonyms: [
+      "damaged",
+      "defective",
+      "wrong",
+      "product",
+      "replacement",
+      "unboxing",
+      "escalation",
+    ],
+  },
+  {
+    pattern:
+      /(?:कैश|पेमेंट|सीओडी|\b(?:cod|cash\s+on\s+delivery|prepaid|upi|payment|pay|coad)\b)/i,
+    synonyms: ["cod", "cash", "delivery", "prepaid", "payment", "confirmation"],
+  },
+  {
+    pattern:
+      /(?:करुंगाली|माला|ब्रेसलेट|रुद्राक्ष|त्रिशूल|मुरुगन|हनुमान|\b(?:karungali|malai|mala|ebony|rudraksha|trishul|trishool|murugan|hanuman|gada|khatu|shyam|shiva|nandi|bead|beads)\b)/i,
+    synonyms: [
+      "karungali",
+      "malai",
+      "mala",
+      "ebony",
+      "wood",
+      "bracelet",
+      "rudraksha",
+      "pendant",
+      "certified",
+      "108",
+      "beads",
+      "999",
+    ],
+  },
+  {
+    pattern:
+      /(?:पाइराइट|क्रिस्टल|चक्र|स्टोन|\b(?:pyrite|wealth|magnet|chakra|tiger\s*eye|obsidian|hematite|quartz|amethyst|band|stone|rainbow)\b)/i,
+    synonyms: [
+      "pyrite",
+      "wealth",
+      "band",
+      "money",
+      "magnet",
+      "bracelet",
+      "chakra",
+      "combo",
+      "stone",
+    ],
+  },
+  {
+    pattern:
+      /(?:अगरबत्ती|धूप|हवन|कप|स्टिक|खुशबू|चंदन|गुलाब|\b(?:agarbatti|incense|dhoop|dhup|havan|hawan|cup|cups|stick|sticks|kitni|trial|refill|kesar|chandan|gulab|nagchampa|fragrance|ceramic|stand|699|449)\b)/i,
+    synonyms: [
+      "incense",
+      "sticks",
+      "agarbatti",
+      "dhoop",
+      "havan",
+      "cups",
+      "trial",
+      "pack",
+      "refill",
+      "100",
+      "fragrances",
+      "ceramic",
+      "stands",
+      "699",
+      "449",
+    ],
+  },
+  {
+    pattern:
+      /(?:असली|नकली|सर्टिफिकेट|सर्टिफाइड|लैब|\b(?:asli|nakli|original|real|fake|certified|certificate|certification|authenticity|lab|govt|quality)\b)/i,
+    synonyms: [
+      "authenticity",
+      "certification",
+      "certified",
+      "govt",
+      "lab",
+      "original",
+      "ebony",
+    ],
+  },
+  {
+    pattern:
+      /(?:कीमत|प्राइस|दाम|कितने\s*का|ऑफर|कॉम्बो|\b(?:price|cost|rate|daam|dam|kitne\s+ka|kitna|offer|combo|bundle|bogo|buy\s*2)\b)/i,
+    synonyms: ["price", "variant", "mrp", "combo", "bundle", "offer", "stock"],
+  },
+  {
+    pattern:
+      /(?:ऑर्डर\s*कैसे|कैसे\s*खरीदें|संपर्क|नंबर|\b(?:order\s+kais[ae]|kais[ae]\s+kar[eo]|how\s+to\s+order|how\s+to\s+buy|contact|helpline|support\s+number|address)\b)/i,
+    synonyms: ["contact", "support", "website", "order", "shipping", "cod", "phone", "email"],
+  },
+];
+
+/**
+ * Expands Hindi (Devanagari) and Roman Hinglish queries with canonical English store keywords
+ * so PostgreSQL English FTS, keyword lexical scoring, and vector retrieval work seamlessly.
+ */
+export function expandHindiAndHinglishQuery(query: string): {
+  expandedQuery: string;
+  expansionTerms: string[];
+  hasHindiOrHinglish: boolean;
+} {
+  const clean = String(query || "").trim();
+  if (!clean) {
+    return { expandedQuery: "", expansionTerms: [], hasHindiOrHinglish: false };
+  }
+
+  const hasDevanagari = /[\u0900-\u097F]/.test(clean);
+  const hasHinglishTokens =
+    /\b(?:mera|meri|mere|magya|mangaya|mangwaya|aaya|aya|nhi|nahi|nathi|aviyo|kab|kaha|kahan|kitni|kitna|kitne|kais[ae]|kar[eo]|krdo|chahiye|wapas|vapas|pais[ae]|toot[ai]?|tut[ai]?|kharab|galat|asli|nakli|agarbatti|dhoop|dhup|hawan|malai|odar)\b/i.test(
+      clean,
+    );
+
+  const matchedSynonyms = new Set<string>();
+  for (const rule of HINDI_HINGLISH_SYNONYM_RULES) {
+    if (rule.pattern.test(clean)) {
+      for (const term of rule.synonyms) {
+        matchedSynonyms.add(term);
+      }
+    }
+  }
+
+  const expansionTerms = [...matchedSynonyms];
+  const expandedQuery =
+    expansionTerms.length > 0 ? `${clean} ${expansionTerms.join(" ")}` : clean;
+
+  return {
+    expandedQuery,
+    expansionTerms,
+    hasHindiOrHinglish: hasDevanagari || hasHinglishTokens,
+  };
+}
+
+const FTS_STOP_WORDS = new Set([
+  "the",
+  "and",
+  "for",
+  "with",
+  "that",
+  "this",
+  "from",
+  "have",
+  "what",
+  "when",
+  "where",
+  "how",
+  "can",
+  "you",
+  "your",
+  "are",
+  "was",
+  "will",
+  "please",
+  "help",
+  "satmi",
+  "mera",
+  "meri",
+  "mere",
+  "hai",
+  "tha",
+  "thi",
+  "aur",
+  "kya",
+  "maine",
+  "mujhe",
+]);
+
+/**
+ * Builds a safe PostgreSQL `to_tsquery('english', ...)` OR-expression from an expanded query
+ * so multi-word or Hindi/Hinglish queries retrieve any chunk matching any core keyword.
+ */
+export function buildFtsOrQuery(query: string): string {
+  const { expandedQuery } = expandHindiAndHinglishQuery(query);
+  const terms = [
+    ...new Set(
+      expandedQuery
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, " ")
+        .split(/\s+/)
+        .filter((t) => t.length >= 3 && !FTS_STOP_WORDS.has(t) && !/^\d{5,}$/.test(t)),
+    ),
+  ].slice(0, 18);
+  return terms.join(" | ");
+}
+
+export function computeKeywordLexicalScore(
+  query: string,
+  heading: string,
+  content: string,
+): number {
+  const { expandedQuery, expansionTerms, hasHindiOrHinglish } =
+    expandHindiAndHinglishQuery(query);
+  const rawTerms = [
     ...new Set(
       String(query || "")
         .toLowerCase()
         .replace(/[^a-z0-9₹#]/g, " ")
         .split(/\s+/)
-        .filter((t) => t.length >= 3 && !stopWords.has(t))
+        .filter((t) => t.length >= 3 && !FTS_STOP_WORDS.has(t)),
     ),
   ];
+
+  // For Hindi/Hinglish queries (where raw English terms are scarce), score primarily against expanded canonical terms
+  const queryTerms =
+    hasHindiOrHinglish && expansionTerms.length > 0
+      ? [...new Set([...rawTerms, ...expansionTerms])]
+      : rawTerms.length > 0
+        ? [...new Set([...rawTerms, ...expansionTerms.slice(0, 5)])]
+        : [
+            ...new Set(
+              expandedQuery
+                .toLowerCase()
+                .replace(/[^a-z0-9₹#]/g, " ")
+                .split(/\s+/)
+                .filter((t) => t.length >= 3 && !FTS_STOP_WORDS.has(t)),
+            ),
+          ];
+
   if (queryTerms.length === 0) return 0;
 
   const hayHeading = String(heading || "").toLowerCase();
   const hayContent = String(content || "").toLowerCase();
   let matchedWeight = 0;
   let totalWeight = 0;
+  let matchedCount = 0;
 
   for (const term of queryTerms) {
     const termWeight = term.length >= 6 ? 1.5 : 1.0;
     totalWeight += termWeight;
     if (hayHeading.includes(term)) {
-      matchedWeight += termWeight * 1.35;
+      matchedWeight += termWeight * 1.4;
+      matchedCount++;
     } else if (hayContent.includes(term)) {
       matchedWeight += termWeight;
+      matchedCount++;
     }
   }
 
-  return totalWeight > 0 ? Math.min(1, matchedWeight / totalWeight) : 0;
+  if (totalWeight <= 0) return 0;
+  // When synonym expansion adds a broad set of related keywords, normalize by a capped denominator
+  // so matching 3-5 core synonyms achieves a strong lexical score (>= 0.45).
+  const effectiveDenominator = hasHindiOrHinglish
+    ? Math.min(totalWeight, Math.max(4.5, matchedCount * 1.35))
+    : Math.min(totalWeight, Math.max(3.5, rawTerms.length * 1.35));
+  return Math.min(1, matchedWeight / effectiveDenominator);
 }
 
 let cachedShiprocketToken: { token: string; expiresAt: number } | null = null;
@@ -1407,6 +1903,7 @@ export async function fetchLiveOrderTrackingInfo(params: {
 export async function retrieveStoreContext(params: {
   query: string;
   latestMessageText?: string;
+  threadContextText?: string;
   ticketId?: string;
   customerEmail?: string;
   customerPhone?: string;
@@ -1417,11 +1914,14 @@ export async function retrieveStoreContext(params: {
   inboundAuthVerified?: boolean;
   vipThreshold?: number;
   topK?: number;
+  maxChunksPerDoc?: number;
 }): Promise<StoreContextBundle> {
   const db = await operationsDb();
   const cleanQuery = String(params.query || "").trim();
   const latestText = String(params.latestMessageText || params.query || "").trim();
+  const threadText = String(params.threadContextText || "").trim();
   const topK = Math.max(1, Math.min(15, params.topK || 6));
+  const maxChunksPerDoc = Math.max(1, Math.min(topK, params.maxChunksPerDoc || 2));
   const vipThreshold = Number(params.vipThreshold || 3000);
 
   // Ensure default store policies exist if knowledge base is completely empty
@@ -1434,7 +1934,8 @@ export async function retrieveStoreContext(params: {
   }
 
   // --- TIER 1: DETERMINISTIC LIVE CUSTOMER & ORDER LOOKUP ---
-  const hints = extractOrderOrPhoneHints(cleanQuery);
+  const combinedHintText = [cleanQuery, latestText, threadText].filter(Boolean).join("\n");
+  const hints = extractOrderOrPhoneHints(combinedHintText);
   const latestHints = extractOrderOrPhoneHints(latestText);
   const channel = String(params.channel || "email");
   const externalUserId = String(params.externalUserId || "");
@@ -1736,17 +2237,29 @@ export async function retrieveStoreContext(params: {
     }
   }
 
-  // --- TIER 2: HYBRID VECTOR + LEXICAL FULL-TEXT SEARCH WITH RRF ---
+  // --- TIER 2: HYBRID VECTOR + LEXICAL FULL-TEXT SEARCH WITH RRF & DIVERSITY CAP ---
+  const focusedTextForSearch =
+    latestText && cleanQuery.length > latestText.length * 2.5
+      ? `${cleanQuery.split("\n")[0] || ""}\n${latestText}`.trim()
+      : cleanQuery;
+  const { expandedQuery, expansionTerms, hasHindiOrHinglish } =
+    expandHindiAndHinglishQuery(focusedTextForSearch);
+  const semanticSearchInput =
+    hasHindiOrHinglish && expansionTerms.length > 0
+      ? `${focusedTextForSearch}\nKeywords: ${expansionTerms.join(" ")}`
+      : focusedTextForSearch;
+  const ftsOrQuery = buildFtsOrQuery(focusedTextForSearch);
+
   const {
     embedding: queryEmbedding,
     model: embeddingModel,
     usage: embeddingUsage,
-  } = await embedText(cleanQuery, "RETRIEVAL_QUERY");
+  } = await embedText(semanticSearchInput, "RETRIEVAL_QUERY");
 
   const hasPgVector = await isPgVectorAvailable();
   const vectorLiteral = `[${queryEmbedding.join(",")}]`;
 
-  const ftsCandidatesPromise = cleanQuery
+  const ftsCandidatesPromise = ftsOrQuery
     ? db
         .prepare(
           `SELECT
@@ -1759,16 +2272,16 @@ export async function retrieveStoreContext(params: {
              d.title AS document_title,
              d.category,
              d.source_ref,
-             ts_rank_cd(c.search_tsv, websearch_to_tsquery('english', ?)) AS fts_rank
+             ts_rank_cd(c.search_tsv, to_tsquery('english', ?)) AS fts_rank
            FROM support_knowledge_chunks c
            JOIN support_knowledge_documents d ON d.id = c.document_id
            WHERE d.is_active = TRUE
              AND (d.expires_at IS NULL OR d.expires_at > now())
-             AND c.search_tsv @@ websearch_to_tsquery('english', ?)
+             AND c.search_tsv @@ to_tsquery('english', ?)
            ORDER BY fts_rank DESC, d.updated_at DESC
-           LIMIT 150`,
+           LIMIT 180`,
         )
-        .bind(cleanQuery, cleanQuery)
+        .bind(ftsOrQuery, ftsOrQuery)
         .all<Record<string, unknown>>()
         .catch(() => ({ results: [] as Record<string, unknown>[] }))
     : Promise.resolve({ results: [] as Record<string, unknown>[] });
@@ -1788,7 +2301,7 @@ export async function retrieveStoreContext(params: {
                d.category,
                d.source_ref,
                CASE
-                 WHEN ? <> '' THEN ts_rank_cd(c.search_tsv, websearch_to_tsquery('english', ?))
+                 WHEN ? <> '' THEN ts_rank_cd(c.search_tsv, to_tsquery('english', ?))
                  ELSE 0
                END AS fts_rank,
                1 - (c.embedding <=> ?::vector) AS pg_vec_sim
@@ -1797,11 +2310,11 @@ export async function retrieveStoreContext(params: {
              WHERE d.is_active = TRUE
                AND (d.expires_at IS NULL OR d.expires_at > now())
                AND c.embedding IS NOT NULL
-               AND c.embedding_model = ?
+               AND (c.embedding_model = ? OR c.embedding_model = '')
              ORDER BY c.embedding <=> ?::vector ASC
-             LIMIT 120`,
+             LIMIT 160`,
           )
-          .bind(cleanQuery, cleanQuery, vectorLiteral, embeddingModel, vectorLiteral)
+          .bind(ftsOrQuery, ftsOrQuery, vectorLiteral, embeddingModel, vectorLiteral)
           .all<Record<string, unknown>>()
           .catch(() => ({ results: [] as Record<string, unknown>[] }))
       : db
@@ -1817,7 +2330,7 @@ export async function retrieveStoreContext(params: {
                d.category,
                d.source_ref,
                CASE
-                 WHEN ? <> '' THEN ts_rank_cd(c.search_tsv, websearch_to_tsquery('english', ?))
+                 WHEN ? <> '' THEN ts_rank_cd(c.search_tsv, to_tsquery('english', ?))
                  ELSE 0
                END AS fts_rank
              FROM support_knowledge_chunks c
@@ -1833,9 +2346,9 @@ export async function retrieveStoreContext(params: {
                  ELSE 4
                END ASC,
                d.updated_at DESC
-             LIMIT 600`,
+             LIMIT 5000`,
           )
-          .bind(cleanQuery, cleanQuery)
+          .bind(ftsOrQuery, ftsOrQuery)
           .all<Record<string, unknown>>()
           .catch((err) => {
             console.warn("Knowledge chunk retrieval failed", {
@@ -1867,32 +2380,51 @@ export async function retrieveStoreContext(params: {
     lexicalScore: number;
   };
 
+  let lazyLocalQueryVec: number[] | null = null;
+  const getLocalQueryVec = () => {
+    if (!lazyLocalQueryVec) {
+      lazyLocalQueryVec = deterministicLocalEmbedding(expandedQuery);
+    }
+    return lazyLocalQueryVec;
+  };
+
   const candidates: ScoredCandidate[] = Array.from(dedupedRows.values()).map((r) => {
     const chunkModel = String(r.embedding_model || "");
-    const compatibleVectorSpace =
-      chunkModel === embeddingModel ||
-      (chunkModel === "" && embeddingModel !== "satmi-hashed-ngram-768");
+    let emb: number[] | null = null;
+    if (Array.isArray(r.embedding_json)) {
+      emb = r.embedding_json as number[];
+    } else if (typeof r.embedding_json === "string") {
+      try {
+        emb = JSON.parse(r.embedding_json) as number[];
+      } catch {
+        emb = null;
+      }
+    }
+
+    const chunkIsSparseHashed =
+      chunkModel === "satmi-hashed-ngram-768" ||
+      (chunkModel === "" && isSparseHashedVector(emb));
+
+    const compatibleNeuralSpace =
+      !chunkIsSparseHashed &&
+      (chunkModel === embeddingModel ||
+        (chunkModel === "" && embeddingModel !== "satmi-hashed-ngram-768"));
 
     let vecSim = 0;
-    if (typeof r.pg_vec_sim === "number" && compatibleVectorSpace) {
+    if (typeof r.pg_vec_sim === "number" && compatibleNeuralSpace) {
       vecSim = Math.max(0, r.pg_vec_sim);
-    } else if (compatibleVectorSpace) {
-      let emb: number[] | null = null;
-      if (Array.isArray(r.embedding_json)) {
-        emb = r.embedding_json as number[];
-      } else if (typeof r.embedding_json === "string") {
-        try {
-          emb = JSON.parse(r.embedding_json) as number[];
-        } catch {
-          emb = null;
-        }
-      }
+    } else if (compatibleNeuralSpace && emb) {
       vecSim = Math.max(0, cosineSimilarity(queryEmbedding, emb));
+    } else if (chunkIsSparseHashed && emb) {
+      // Fallback compatibility when a chunk is still stored as satmi-hashed-ngram-768
+      const localQueryVec =
+        embeddingModel === "satmi-hashed-ngram-768" ? queryEmbedding : getLocalQueryVec();
+      vecSim = Math.max(0, cosineSimilarity(localQueryVec, emb) * (embeddingModel === "satmi-hashed-ngram-768" ? 1 : 0.85));
     }
 
     const ftsRank = Math.min(1, Number(r.fts_rank || 0) * 2.5);
     const kwScore = computeKeywordLexicalScore(
-      cleanQuery,
+      focusedTextForSearch,
       String(r.heading || ""),
       String(r.content || "")
     );
@@ -1922,7 +2454,7 @@ export async function retrieveStoreContext(params: {
   byLexical.forEach((c, idx) => lexicalRankMap.set(c.chunkId, idx + 1));
 
   const RRF_K = 60;
-  const fused: RetrievedRagChunk[] = candidates
+  const scoredAll: RetrievedRagChunk[] = candidates
     .map((c) => {
       const vRank = vectorRankMap.get(c.chunkId) || 999;
       const lRank = lexicalRankMap.get(c.chunkId) || 999;
@@ -1930,15 +2462,17 @@ export async function retrieveStoreContext(params: {
         (c.vectorSimilarity > 0.05 ? 1 / (RRF_K + vRank) : 0) +
         (c.lexicalScore > 0.08 ? 1 / (RRF_K + lRank) : 0);
 
-      // Boost verified admin_memory and store policies when they match well
+      // Boost verified admin_memory and store policies when they match well; slightly deprioritize raw reply templates
       const categoryBoost =
         c.category === "admin_memory" && (c.lexicalScore >= 0.25 || c.vectorSimilarity >= 0.35)
           ? 0.006
           : c.category === "policy" && (c.lexicalScore >= 0.2 || c.vectorSimilarity >= 0.3)
             ? 0.004
-            : 0;
+            : c.category === "template"
+              ? -0.003
+              : 0;
 
-      const rrfScore = Number((baseRrf + categoryBoost).toFixed(6));
+      const rrfScore = Number(Math.max(0, baseRrf + categoryBoost).toFixed(6));
       return {
         ...c,
         rrfScore,
@@ -1948,8 +2482,64 @@ export async function retrieveStoreContext(params: {
     .sort((a, b) => {
       if (b.rrfScore !== a.rrfScore) return b.rrfScore - a.rrfScore;
       return b.lexicalScore + b.vectorSimilarity - (a.lexicalScore + a.vectorSimilarity);
-    })
-    .slice(0, topK);
+    });
+
+  // Enforce Document Diversity Cap:
+  // First pass selects up to 1 top chunk per distinct document (up to topK).
+  // If fewer than topK chunks are filled, second pass allows up to maxChunksPerDoc per document.
+  const fused: RetrievedRagChunk[] = [];
+  const docChunkCounts = new Map<string, number>();
+  const remainingChunks: RetrievedRagChunk[] = [];
+
+  for (const chunk of scoredAll) {
+    const count = docChunkCounts.get(chunk.documentId) || 0;
+    if (count === 0 && fused.length < topK) {
+      fused.push(chunk);
+      docChunkCounts.set(chunk.documentId, 1);
+    } else if (count < maxChunksPerDoc) {
+      remainingChunks.push(chunk);
+    }
+  }
+
+  for (const chunk of remainingChunks) {
+    if (fused.length >= topK) break;
+    const count = docChunkCounts.get(chunk.documentId) || 0;
+    if (count < maxChunksPerDoc) {
+      fused.push(chunk);
+      docChunkCounts.set(chunk.documentId, count + 1);
+    }
+  }
+
+  // Enrich selected chunks when a document (e.g. a Shopify product card) was split into
+  // tiny section chunks (c0: "Brand / Vendor: Satmi", c1: Description, c2: "Price: ₹...")
+  // so that 1 retrieved document slot carries complete description + variant pricing.
+  const siblingsByDoc = new Map<string, ScoredCandidate[]>();
+  for (const cand of candidates) {
+    const list = siblingsByDoc.get(cand.documentId) || [];
+    list.push(cand);
+    siblingsByDoc.set(cand.documentId, list);
+  }
+
+  for (const item of fused) {
+    if ((docChunkCounts.get(item.documentId) || 0) > 1) continue;
+    const siblings = siblingsByDoc.get(item.documentId) || [];
+    if (siblings.length <= 1 || siblings.length > 5) continue;
+    const orderedSiblings = [...siblings].sort((a, b) =>
+      a.chunkId.localeCompare(b.chunkId, undefined, { numeric: true }),
+    );
+    const mergedParts: string[] = [];
+    let totalChars = 0;
+    for (const sib of orderedSiblings) {
+      const part = sib.content.trim();
+      if (!part) continue;
+      if (totalChars + part.length > 1600 && mergedParts.length > 0) continue;
+      mergedParts.push(part);
+      totalChars += part.length;
+    }
+    if (mergedParts.length > 1) {
+      item.content = mergedParts.join("\n\n");
+    }
+  }
 
   const topRrfScore = fused[0]?.rrfScore || 0;
   const topVectorSimilarity = fused.reduce((m, c) => Math.max(m, c.vectorSimilarity), 0);

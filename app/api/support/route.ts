@@ -23,6 +23,7 @@ import {
   deleteKnowledgeDocument,
   fetchLiveOrderTrackingInfo,
   listKnowledgeDocuments,
+  repairKnowledgeChunkEmbeddings,
   syncStoreKnowledgeToRag,
   upsertKnowledgeDocument,
   type KnowledgeCategory,
@@ -266,7 +267,12 @@ async function POSTHandler(r: Request) {
       let drafts = 0;
       let askedAdmin = 0;
       let humanActions = 0;
-      for (const row of candidates.results) {
+      const paceMs = Math.max(0, Number(process.env.AI_BATCH_PACE_MS ?? 650));
+      for (let idx = 0; idx < candidates.results.length; idx++) {
+        if (idx > 0 && paceMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, paceMs));
+        }
+        const row = candidates.results[idx];
         const res = await runAiAgentOnTicket({
           ticketId: String(row.id),
           actorId: u.id,
@@ -479,6 +485,19 @@ async function POSTHandler(r: Request) {
         ok: true,
         ...syncRes,
         notice: `Synced Store Knowledge to RAG (${syncRes.totalDocuments} documents, ${syncRes.totalChunks} indexed chunks${shopifyPart}).`,
+      });
+    }
+
+    if (b.action === "ai_knowledge_reembed") {
+      if (!manager(u)) throw new HttpError(403, "Manager access required");
+      const repairRes = await repairKnowledgeChunkEmbeddings({
+        forceAll: b.forceAll === true,
+        actorId: u.id,
+      });
+      return Response.json({
+        ok: true,
+        ...repairRes,
+        notice: `Repaired RAG embeddings (${repairRes.reEmbedded} chunk(s) re-embedded to ${repairRes.targetModel}, ${repairRes.alreadyHealthy} already healthy).`,
       });
     }
 

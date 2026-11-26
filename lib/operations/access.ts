@@ -15,7 +15,7 @@ export async function access(
   request?: Request,
   area: "inventory" | "support" = "support",
 ) {
-  const a = await requireApiUser();
+  const a = await requireApiUser(request);
   if (a.response) throw new HttpError(401, "Please sign in to continue");
   if (request && request.method !== "GET" && !isSameOrigin(request))
     throw new HttpError(403, "Invalid request origin");
